@@ -256,6 +256,50 @@ def guest_home(name: str, inst: dict) -> str:
     return _GUEST_HOME[name]
 
 
+def guest_ip(name: str, inst: dict) -> str:
+    """Address other guests can reach. The bridged NIC, not lima's NAT eth0."""
+    if inst["backend"] == "ssh":
+        return inst.get("host", "")
+    r = subprocess.run(
+        ssh_cmd(name, inst)
+        + ["ip -4 -o addr show scope global | awk '{print $2, $4}'"],
+        capture_output=True, text=True)
+    nat = ""
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        dev, cidr = parts[0], parts[1].split("/")[0]
+        # lima gives every guest the same 192.168.5.15 on NAT eth0; only the
+        # bridged interface is reachable from another VM.
+        if dev.startswith(("lima", "en", "bridge")) or not cidr.startswith("192.168.5."):
+            nat = nat or cidr
+        if dev.startswith("lima"):
+            return cidr
+    return nat
+
+
+MANAGER_PASS_FILE = "/var/wazuh-manager/etc/authd.pass"
+
+
+def manager_secret(cfg: Cfg, run: Runner, mgr_target: str) -> tuple[str, str]:
+    """(ip, registration password) for a manager instance.
+
+    The installation assistant generates a random password; without it enrollment
+    fails with "Invalid password. Unable to add agent (from manager)". Read here so
+    no human has to copy it around.
+    """
+    mname, minst = cfg.resolve(mgr_target)
+    ip = guest_ip(mname, minst)
+    if not ip:
+        die(5, f"{mname}: could not determine a reachable address")
+    r = run.sh(ssh_cmd(mname, minst) + [f"sudo cat {MANAGER_PASS_FILE} 2>/dev/null"])
+    pw = r.stdout.strip()
+    if not pw:
+        print(f"{mname}: no {MANAGER_PASS_FILE}; assuming enrollment needs no password")
+    return ip, pw
+
+
 def guest_tree(name: str, inst: dict, root: Path) -> str:
     """Absolute guest path of the synced tree."""
     base = inst.get("guest_root", "~/wz")
@@ -894,25 +938,41 @@ def v_winagent(cfg: Cfg, run: Runner, args) -> int:
 
 
 def v_install(cfg: Cfg, run: Runner, args) -> int:
-    """Install a built package on a guest, then report the service state."""
+    """Install an agent on a guest and, with --manager, enroll it automatically."""
     name, inst = cfg.resolve(args.targets[0])
+
+    mgr_ip = mgr_pw = ""
+    if args.manager:
+        mgr_ip, mgr_pw = manager_secret(cfg, run, args.manager)
+        print(f"manager {args.manager}: {mgr_ip}"
+              + (f", registration password ({len(mgr_pw)} chars)" if mgr_pw else ""))
+
+    if args.from_source:
+        return install_from_source(cfg, run, name, inst, mgr_ip, mgr_pw)
+
     pkg = Path(args.targets[1]) if len(args.targets) > 1 else None
     if pkg is None or not pkg.is_file():
-        die(2, "install needs a local package: vmx install INSTANCE <file.msi>")
+        die(2, "install needs a local package, or --from-source")
     if inst.get("os") != "windows":
-        die(3, f"{name}: install currently covers Windows guests only")
+        die(3, f"{name}: package install currently covers Windows; "
+               "use --from-source on Linux")
 
     remote = f"C:/Users/{inst['user']}/{pkg.name}"
     if push(run, name, inst, pkg, remote):
         die(1, f"{name}: could not upload {pkg.name}")
-    # KEY=VALUE arguments become MSI properties, which is how the Wazuh agent is
-    # pointed at a manager at install time (WAZUH_MANAGER, WAZUH_AGENT_GROUP,
-    # WAZUH_REGISTRATION_PASSWORD...).
-    props = " ".join(args.vars)
-    # /qn keeps it non-interactive; msiexec returns 3010 when a reboot is pending.
+
+    # KEY=VALUE arguments become MSI properties; --manager fills in the two that
+    # enrollment needs, unless they were given explicitly.
+    props = list(args.vars)
+    given = {v.split("=", 1)[0] for v in props}
+    if mgr_ip and "WAZUH_MANAGER" not in given:
+        props.append(f"WAZUH_MANAGER={mgr_ip}")
+    if mgr_pw and "WAZUH_REGISTRATION_PASSWORD" not in given:
+        props.append(f"WAZUH_REGISTRATION_PASSWORD={mgr_pw}")
+
     rc = guest_run(cfg, run, name,
-                   f'msiexec /i "{remote.replace("/", chr(92))}" /qn {props} /l*v '
-                   'C:\\Users\\%USERNAME%\\msi-install.log', capture=True)
+                   f'msiexec /i "{remote.replace("/", chr(92))}" /qn {" ".join(props)} '
+                   '/l*v C:\\Users\\%USERNAME%\\msi-install.log', capture=True)
     if rc not in (0, 3010):
         die(1, f"{name}: msiexec failed ({rc}); log at C:/Users/{inst['user']}/msi-install.log")
 
@@ -921,6 +981,104 @@ def v_install(cfg: Cfg, run: Runner, args) -> int:
     # with 1077, "no start attempted since boot". Start it here.
     guest_run(cfg, run, name, "sc start WazuhSvc", capture=True)
     guest_run(cfg, run, name, "sc query WazuhSvc", capture=True)
+    return 0
+
+
+AGENT_DIR = "/var/ossec"   # install.sh:1122 for USER_INSTALL_TYPE=agent
+
+
+def install_from_source(cfg: Cfg, run: Runner, name: str, inst: dict,
+                        mgr_ip: str, mgr_pw: str) -> int:
+    """Build the agent from the synced tree and install it unattended.
+
+    install.sh prompts for anything a USER_* variable does not answer, so the whole
+    answer set is written to etc/preloaded-vars.conf first. There is no password
+    variable - the source installer cannot enroll with one - so the password is
+    written to <dir>/etc/authd.pass afterwards, which is what the agent reads.
+    """
+    if inst.get("os") != "linux":
+        die(3, f"{name}: --from-source covers Linux guests")
+
+    if guest_run(cfg, run, name,
+                 "make -C src deps TARGET=agent -j$(nproc) > /tmp/vmx-agent-deps.log 2>&1 "
+                 "|| { tail -20 /tmp/vmx-agent-deps.log; exit 1; }", capture=True):
+        die(1, f"{name}: agent deps failed")
+    if fix_host_tools(cfg, run, name):
+        die(1, f"{name}: deps host tools are not runnable")
+    if guest_run(cfg, run, name,
+                 "make -C src TARGET=agent -j$(nproc) > /tmp/vmx-agent-build.log 2>&1 "
+                 f"|| {{ grep -nE '{FAIL_PAT}' /tmp/vmx-agent-build.log | tail -30; exit 1; }}",
+                 capture=True):
+        die(1, f"{name}: agent build failed")
+
+    answers = "\n".join([
+        'USER_LANGUAGE="en"',
+        'USER_INSTALL_TYPE="agent"',
+        f'USER_DIR="{AGENT_DIR}"',
+        'USER_ENABLE_ACTIVE_RESPONSE="y"',
+        'USER_ENABLE_SYSCHECK="y"',
+        'USER_ENABLE_ROOTCHECK="y"',
+        'USER_ENABLE_SYSCOLLECTOR="y"',
+        'USER_ENABLE_SCA="y"',
+        'USER_ENABLE_UPDATE_CHECK="n"',
+        'USER_AUTO_START="y"',
+        'USER_CLEANINSTALL="y"',
+        f'USER_AGENT_MANAGER_IP="{mgr_ip}"' if mgr_ip else "",
+        'USER_AGENT_MANAGER_NAME=""',
+    ])
+    script = (
+        f"printf '%b\\n' '{answers}' > etc/preloaded-vars.conf && "
+        # </dev/null so a prompt we failed to answer fails fast instead of hanging.
+        "sudo ./install.sh < /dev/null > /tmp/vmx-agent-install.log 2>&1 "
+        "|| { tail -25 /tmp/vmx-agent-install.log; exit 1; }; "
+        "tail -5 /tmp/vmx-agent-install.log"
+    )
+    if guest_run(cfg, run, name, script, capture=True):
+        die(1, f"{name}: install.sh failed - /tmp/vmx-agent-install.log on the guest")
+
+    if mgr_pw and apply_registration_password(cfg, run, name, mgr_pw):
+        die(1, f"{name}: could not apply the registration password")
+
+    guest_run(cfg, run, name,
+              f"sudo {AGENT_DIR}/bin/wazuh-control status | head -8", capture=True)
+    return 0
+
+
+def apply_registration_password(cfg: Cfg, run: Runner, name: str, pw: str) -> int:
+    """Write authd.pass on a Linux agent and restart it.
+
+    Ownership matters: wazuh-agentd runs as the `wazuh` user, so a root:root file is
+    unreadable and the agent logs "No authentication password provided" as though the
+    file were absent. The group is taken from the etc directory rather than hardcoded.
+    """
+    return guest_run(
+        cfg, run, name,
+        f"printf '%s' '{pw}' | sudo tee {AGENT_DIR}/etc/authd.pass >/dev/null && "
+        f"sudo chown root:\"$(stat -c %G {AGENT_DIR}/etc)\" {AGENT_DIR}/etc/authd.pass && "
+        f"sudo chmod 640 {AGENT_DIR}/etc/authd.pass && "
+        f"sudo {AGENT_DIR}/bin/wazuh-control restart > /dev/null && echo enrolled",
+        capture=True)
+
+
+def v_enroll(cfg: Cfg, run: Runner, args) -> int:
+    """Re-enroll an already installed agent against a manager, without reinstalling."""
+    name, inst = cfg.resolve(args.targets[0])
+    if not args.manager:
+        die(2, f"enroll needs --manager <instance>")
+    mgr_ip, mgr_pw = manager_secret(cfg, run, args.manager)
+    if inst.get("os") != "linux":
+        die(3, f"{name}: enroll covers Linux agents; on Windows reinstall the MSI "
+               "with --manager")
+    # Point the agent at the manager, then supply the password.
+    if guest_run(cfg, run, name,
+                 f"sudo sed -i 's|<address>.*</address>|<address>{mgr_ip}</address>|' "
+                 f"{AGENT_DIR}/etc/ossec.conf && echo addressed", capture=True):
+        die(1, f"{name}: could not set the manager address")
+    if mgr_pw and apply_registration_password(cfg, run, name, mgr_pw):
+        die(1, f"{name}: could not apply the registration password")
+    guest_run(cfg, run, name,
+              f"sleep 8; sudo grep -E 'Valid key|Connected to the server' "
+              f"{AGENT_DIR}/logs/ossec.log | tail -3", capture=True)
     return 0
 
 
@@ -1047,6 +1205,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--stage2-only", action="store_true")
     ap.add_argument("--symbols", action="store_true")
     ap.add_argument("--stage")
+    ap.add_argument("--manager")
+    ap.add_argument("--from-source", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     return ap
 
@@ -1054,7 +1214,7 @@ def build_parser() -> argparse.ArgumentParser:
 VERBS = {
     "list": v_list, "doctor": v_doctor, "up": v_up, "sync": v_sync, "deps": v_deps,
     "exec": v_exec, "build": v_build, "test": v_test, "winagent": v_winagent,
-    "provision": v_provision, "install": v_install,
+    "provision": v_provision, "install": v_install, "enroll": v_enroll,
     "fetch": v_fetch, "collect": v_collect,
 }
 

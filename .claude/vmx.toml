@@ -108,3 +108,18 @@ template = "template://debian-12"
 cpus     = 2
 memory   = 2
 disk     = 20
+
+# Source-built agent target: Ubuntu 22.04 so the agent is older-distro tested, and
+# built from the tag rather than installed from packages.
+[instances.agent-ubuntu22-arm]
+backend  = "lima"
+instance = "agent-ubuntu22-arm"
+component = "agent"
+os       = "linux"
+arch     = "arm64"
+distro   = "ubuntu22"
+user     = "wazuh"
+template = "template://ubuntu-22.04"
+cpus     = 4
+memory   = 4
+disk     = 30
