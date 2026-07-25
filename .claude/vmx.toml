@@ -125,3 +125,19 @@ template = "template://ubuntu-22.04"
 cpus     = 4
 memory   = 4
 disk     = 30
+
+# x86_64 agent target, Ubuntu 24.04. qemu-emulated on Apple silicon, so builds are
+# 5-20x slower than the arm64 guests - this is the leg that catches
+# architecture-specific problems the arm64 build cannot.
+[instances.agent-ubuntu-amd]
+backend  = "lima"
+instance = "agent-ubuntu-amd"
+component = "agent"
+os       = "linux"
+arch     = "amd64"
+distro   = "ubuntu24"
+user     = "wazuh"
+template = "template://ubuntu-24.04"
+cpus     = 4
+memory   = 4
+disk     = 30

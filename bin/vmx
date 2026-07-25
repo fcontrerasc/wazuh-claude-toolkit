@@ -603,13 +603,17 @@ def create(run: Runner, name: str, inst: dict):
             die(7, f"lima bridged is bound to {have!r} but the LAN is on {want!r}; "
                    f"the VM would get no DHCP lease. Fix ~/.lima/_config/networks.yaml:\n"
                    f"  networks.bridged.interface: {want}")
-        run.sh(cmd, capture=False, check=True)
+        # check=False + die: a raw CalledProcessError traceback tells the user
+        # nothing, and limactl already printed the reason.
+        if run.sh(cmd, capture=False).returncode:
+            die(5, f"{name}: limactl create failed - see the message above")
     elif b == "tart":
         base = inst.get("image")
         if not base:
             die(2, f"{name}: tart instance needs an `image` to clone from")
-        run.sh(["tart", "clone", base, inst.get("instance", name)],
-               capture=False, check=True)
+        if run.sh(["tart", "clone", base, inst.get("instance", name)],
+                  capture=False).returncode:
+            die(5, f"{name}: tart clone failed - see the message above")
     else:
         die(4, f"{name}: creation not supported for backend {b}")
 
@@ -1377,6 +1381,15 @@ def v_doctor(cfg: Cfg, run: Runner, args) -> int:
     check(f"lima bridged -> {want} (LAN)", have == want,
           f"set networks.bridged.interface: {want} in ~/.lima/_config/networks.yaml "
           f"(currently {have or 'unset'})")
+    # Homebrew's lima bottle ships a guest agent only for the host architecture, so
+    # a non-native guest fails at start with "guest agent binary could not be found".
+    if any(i.get("backend") == "lima" and i.get("arch") == "amd64"
+           for i in cfg.instances.values()):
+        agents = list(Path("/opt/homebrew/Cellar").glob(
+            "lima*/*/share/lima/lima-guestagent.Linux-x86_64.gz"))
+        check("lima x86_64 guest agent", bool(agents),
+              "brew install lima-additional-guestagents")
+
     sudoers_ok = subprocess.run(["limactl", "sudoers", "--check"],
                                 capture_output=True, text=True).returncode == 0
     check("lima sudoers in sync", sudoers_ok,

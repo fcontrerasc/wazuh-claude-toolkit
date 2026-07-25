@@ -80,7 +80,9 @@ bin/vmx test  <instance> [--ctest-filter RE] [--json]
 bin/vmx winagent --issue N [--debug] [--builder I] [--packager I]
 bin/vmx install <instance> <pkg> [KEY=VALUE...] [--manager I]
 bin/vmx install <instance> --from-source [--manager I]
-bin/vmx enroll  <instance> --manager I
+bin/vmx enroll  <instance> --manager I [--force]
+bin/vmx agents   <manager>                     # id, name, status, version
+bin/vmx agent-rm <manager> <id|name>...        # delete via the manager API
 bin/vmx fetch <instance> PATH... --issue N
 bin/vmx collect <instance> --issue N --from PATH...
 ```
@@ -182,6 +184,24 @@ applied differently per platform:
 | Linux source | `USER_AGENT_MANAGER_IP` in `preloaded-vars.conf` | `authd.pass` written **after** install — `install.sh` has no password variable |
 
 Explicit `KEY=VALUE` arguments always win over `--manager`.
+
+**Rebuilt a VM? The old registration blocks it.** The agent name comes from the
+instance name, so a recreated VM hits `Duplicate agent name` forever. Either delete
+the record first or pass `--force`, which does it for you:
+
+```bash
+bin/vmx agent-rm aio-ubuntu-arm agent-macos-arm
+bin/vmx enroll   agent-macos-arm --manager aio-ubuntu-arm --force
+```
+
+**Never edit `client.keys` by hand.** It desynchronises the manager database from
+authd's registry, and the API then refuses to delete the agent with
+`Agent does not exist` (1701) while still listing it as active — a state only a
+restore-plus-restart repairs. `agent-rm` runs the API from inside the manager guest
+(no exposed port, local certificate) and does the two-step dance:
+`POST /security/user/authenticate?raw=true` then
+`DELETE /agents?agents_list=…&status=all&older_than=0s`. API credentials come from
+`api_user`/`api_password` in `vmx.toml` (default `wazuh:wazuh`).
 
 Four things here are not obvious and each one broke a run:
 
