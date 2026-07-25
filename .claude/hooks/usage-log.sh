@@ -20,8 +20,12 @@ case "$EVENT" in
     UserPromptSubmit)
         # Slash commands only; free-form prompts are not tooling usage.
         PROMPT="$(printf '%s' "$INPUT" | jq -r '.prompt // ""')"
-        case "$PROMPT" in
-            /*) kind="command"; name="$(printf '%s' "$PROMPT" | awk '{print $1}')" ;;
+        # A slash command is /word, not any path the user happened to paste
+        # (an absolute path like /Users/... starts with / too).
+        FIRST="$(printf '%s' "$PROMPT" | awk '{print $1}')"
+        case "$FIRST" in
+            /*/*) : ;;                       # a path, not a command
+            /[a-zA-Z]*) kind="command"; name="$FIRST" ;;
         esac
         ;;
     PreToolUse)
