@@ -53,13 +53,14 @@ cpus     = 4
 memory   = 4
 disk     = 40
 
-[instances.dev-macos-arm]
+[instances.agent-macos-arm]
 backend  = "tart"
-instance = "wazuh-agent"
-component = "dev"
+instance = "agent-macos-arm"
+component = "agent"
 os       = "macos"
 arch     = "arm64"
 user     = "admin"   # cirruslabs base image default; fine as-is
+# Reuses the existing local VM; cloning the OCI base image needs ~33GB.
 image    = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
 identity_file = "~/.ssh/wazuh-vmx"
 # bridge: omitted so vmx binds the interface holding the default route (en1 here)

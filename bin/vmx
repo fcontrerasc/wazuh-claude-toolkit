@@ -215,11 +215,17 @@ def ssh_cmd(name: str, inst: dict) -> list[str]:
             die(4, f"{name}: lima instance not started (no {cfg})")
         return ["ssh", "-F", str(cfg), f"lima-{i}"]
     if b == "tart":
-        ip = subprocess.run(
-            ["tart", "ip", inst.get("instance", name)], capture_output=True, text=True
-        ).stdout.strip()
-        if not ip:
-            die(4, f"{name}: tart VM has no IP (not running?)")
+        # Bridged VMs are invisible to tart's default DHCP-lease resolver; ARP finds
+        # them. Try ARP first, then fall back for NAT-mode VMs.
+        ip = ""
+        for extra in (["--resolver", "arp"], []):
+            r = subprocess.run(["tart", "ip", inst.get("instance", name)] + extra,
+                               capture_output=True, text=True)
+            ip = r.stdout.strip()
+            if ip and not ip.startswith("no "):
+                break
+        if not ip or ip.startswith("no "):
+            die(4, f"{name}: tart VM has no IP (not running, or still booting?)")
         return (["ssh", "-o", "StrictHostKeyChecking=no"] + identity_args(inst)
                 + [f"{inst['user']}@{ip}"])
     if b == "ssh":
@@ -446,15 +452,24 @@ def v_up(cfg: Cfg, run: Runner, args) -> int:
             if not run.dry:
                 run.sh(ssh_cmd(name, inst)
                        + [f"sudo hostnamectl set-hostname {shlex.quote(name)}"])
-        elif b == "tart" and not already:
-            # Bridged for visibility; detached so the VM outlives this process.
-            net = inst.get("bridge", default_bridge())
-            cmd = ["tart", "run", inst.get("instance", name), "--no-graphics",
-                   f"--net-bridged={net}"]
-            if run.dry:
-                print("+ " + " ".join(cmd) + " &")
-            else:
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif b == "tart":
+            if not already:
+                # Bridged for visibility; detached so the VM outlives this process.
+                net = inst.get("bridge", default_bridge())
+                cmd = ["tart", "run", inst.get("instance", name), "--no-graphics",
+                       f"--net-bridged={net}"]
+                if run.dry:
+                    print("+ " + " ".join(cmd) + " &")
+                else:
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            # The image ships its own hostname, which would become the agent name
+            # registered on the manager. Idempotent, so it runs on every up.
+            if not run.dry and already:
+                run.sh(ssh_cmd(name, inst) + [
+                    f"sudo scutil --set HostName {shlex.quote(name)}; "
+                    f"sudo scutil --set LocalHostName {shlex.quote(name)}; "
+                    f"sudo scutil --set ComputerName {shlex.quote(name)}"])
         print(f"{name}: up")
     return 0
 
@@ -621,8 +636,10 @@ def v_provision(cfg: Cfg, run: Runner, args) -> int:
     # not built from source here (agent and manager are the buildable pieces).
     if inst.get("component") in ("aio", "manager", "indexer", "dashboard"):
         return provision_stack(cfg, run, name, inst, getattr(cfg, "stage", None))
+    if inst.get("os") == "macos":
+        return provision_macos(cfg, run, name, inst)
     if inst.get("os") != "linux":
-        die(3, f"{name}: provision covers Linux and Windows guests")
+        die(3, f"{name}: provision covers Linux, macOS and Windows guests")
     pkgs = " ".join(PROVISION_APT)
     script = (
         "set -e; export DEBIAN_FRONTEND=noninteractive; "
@@ -729,6 +746,44 @@ def provision_stack(cfg: Cfg, run: Runner, name: str, inst: dict,
                "/var/log/wazuh-install.log on the guest")
     print(f"{name}: stack {stage} installed")
     return 0
+
+
+CMAKE_MACOS_VERSION = "3.31.6"   # the version CI pins (reinstall_cmake default)
+CMAKE_MACOS_DIR = f"/opt/cmake-{CMAKE_MACOS_VERSION}"
+CMAKE_MACOS_URL = (f"https://github.com/Kitware/CMake/releases/download/"
+                   f"v{CMAKE_MACOS_VERSION}/cmake-{CMAKE_MACOS_VERSION}-macos-universal.tar.gz")
+# /usr/local/bin first so the pinned cmake wins over brew's 4.x.
+MACOS_PATH = "/usr/local/bin:/opt/homebrew/bin:$PATH"
+# Same list with no variable to expand, for handing to `sudo env`.
+MACOS_PATH_LITERAL = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def provision_macos(cfg: Cfg, run: Runner, name: str, inst: dict) -> int:
+    """Install what a macOS agent build needs beyond the Xcode command line tools.
+
+    The cirruslabs base image ships Xcode CLT (make, clang) and Homebrew, but not
+    cmake, and brew is not on a non-interactive PATH.
+    """
+    # Homebrew ships CMake 4.x, which REFUSES projects declaring
+    # cmake_minimum_required below 3.5 - and two bundled deps do exactly that
+    # (2.8.12 and 3.4). Pin CI's 3.31.6 from Kitware and put it ahead of brew.
+    script = (
+        f'export PATH="{MACOS_PATH}"; '
+        "xcode-select -p >/dev/null 2>&1 || "
+        "{ echo 'Xcode command line tools missing: xcode-select --install'; exit 1; }; "
+        f"major=$(cmake --version 2>/dev/null | awk 'NR==1{{split($3,a,\".\"); print a[1]}}'); "
+        f'if [ "$major" != "3" ]; then '
+        f"  curl -fsSL -o /tmp/cmake.tgz {CMAKE_MACOS_URL} && "
+        f"  sudo mkdir -p {CMAKE_MACOS_DIR} && "
+        f"  sudo tar xzf /tmp/cmake.tgz -C {CMAKE_MACOS_DIR} --strip-components=1 && "
+        f"  for t in cmake ctest cpack; do "
+        f"    sudo ln -sf {CMAKE_MACOS_DIR}/CMake.app/Contents/bin/$t /usr/local/bin/$t; "
+        f"  done; "
+        "fi; "
+        "echo \"provisioned: $(cmake --version | head -1), "
+        "$(clang --version | head -1)\""
+    )
+    return 1 if guest_run(cfg, run, name, script, capture=True) else 0
 
 
 def provision_windows(cfg: Cfg, run: Runner, name: str, inst: dict) -> int:
@@ -984,7 +1039,11 @@ def v_install(cfg: Cfg, run: Runner, args) -> int:
     return 0
 
 
-AGENT_DIR = "/var/ossec"   # install.sh:1122 for USER_INSTALL_TYPE=agent
+def agent_dir(inst: dict) -> str:
+    """Agent home. install.sh defaults to /var/ossec, but macOS uses /Library/Ossec
+    (docs, packages/macos/*, src/init/pkg_installer.sh:30), so USER_DIR is set
+    explicitly there rather than taking the default."""
+    return "/Library/Ossec" if inst.get("os") == "macos" else "/var/ossec"
 
 
 def install_from_source(cfg: Cfg, run: Runner, name: str, inst: dict,
@@ -996,17 +1055,22 @@ def install_from_source(cfg: Cfg, run: Runner, name: str, inst: dict,
     variable - the source installer cannot enroll with one - so the password is
     written to <dir>/etc/authd.pass afterwards, which is what the agent reads.
     """
-    if inst.get("os") != "linux":
-        die(3, f"{name}: --from-source covers Linux guests")
+    if inst.get("os") not in ("linux", "macos"):
+        die(3, f"{name}: --from-source covers Linux and macOS guests")
+    adir = agent_dir(inst)
+    jobs = "$(sysctl -n hw.ncpu)" if inst.get("os") == "macos" else "$(nproc)"
 
+    prefix = (f'export PATH="{MACOS_PATH}"; ' if inst.get("os") == "macos" else "")
     if guest_run(cfg, run, name,
-                 "make -C src deps TARGET=agent -j$(nproc) > /tmp/vmx-agent-deps.log 2>&1 "
+                 prefix +
+                 f"make -C src deps TARGET=agent -j{jobs} > /tmp/vmx-agent-deps.log 2>&1 "
                  "|| { tail -20 /tmp/vmx-agent-deps.log; exit 1; }", capture=True):
         die(1, f"{name}: agent deps failed")
     if fix_host_tools(cfg, run, name):
         die(1, f"{name}: deps host tools are not runnable")
     if guest_run(cfg, run, name,
-                 "make -C src TARGET=agent -j$(nproc) > /tmp/vmx-agent-build.log 2>&1 "
+                 prefix +
+                 f"make -C src TARGET=agent -j{jobs} > /tmp/vmx-agent-build.log 2>&1 "
                  f"|| {{ grep -nE '{FAIL_PAT}' /tmp/vmx-agent-build.log | tail -30; exit 1; }}",
                  capture=True):
         die(1, f"{name}: agent build failed")
@@ -1014,7 +1078,7 @@ def install_from_source(cfg: Cfg, run: Runner, name: str, inst: dict,
     answers = "\n".join([
         'USER_LANGUAGE="en"',
         'USER_INSTALL_TYPE="agent"',
-        f'USER_DIR="{AGENT_DIR}"',
+        f'USER_DIR="{adir}"',
         'USER_ENABLE_ACTIVE_RESPONSE="y"',
         'USER_ENABLE_SYSCHECK="y"',
         'USER_ENABLE_ROOTCHECK="y"',
@@ -1029,34 +1093,48 @@ def install_from_source(cfg: Cfg, run: Runner, name: str, inst: dict,
     script = (
         f"printf '%b\\n' '{answers}' > etc/preloaded-vars.conf && "
         # </dev/null so a prompt we failed to answer fails fast instead of hanging.
-        "sudo ./install.sh < /dev/null > /tmp/vmx-agent-install.log 2>&1 "
+        # `sudo env PATH=...`: install.sh runs the build itself as root, and sudo
+        # resets PATH - without this the pinned cmake is invisible and the build
+        # dies with "cmake: command not found".
+        # PATH is passed literally, not as "$PATH": install.sh rebuilds the agent
+        # as root and sudo drops the caller's PATH, and relying on inheritance
+        # through ssh -> sh -> sudo -> make -> sh proved unreliable. On macOS this
+        # is what makes the pinned cmake visible ("cmake: command not found"
+        # otherwise); on Linux it is a no-op.
+        f'sudo env PATH="{MACOS_PATH_LITERAL if inst.get("os") == "macos" else "$PATH"}" '
+        "./install.sh < /dev/null > /tmp/vmx-agent-install.log 2>&1 "
         "|| { tail -25 /tmp/vmx-agent-install.log; exit 1; }; "
         "tail -5 /tmp/vmx-agent-install.log"
     )
     if guest_run(cfg, run, name, script, capture=True):
         die(1, f"{name}: install.sh failed - /tmp/vmx-agent-install.log on the guest")
 
-    if mgr_pw and apply_registration_password(cfg, run, name, mgr_pw):
+    if mgr_pw and apply_registration_password(cfg, run, name, inst, mgr_pw):
         die(1, f"{name}: could not apply the registration password")
 
     guest_run(cfg, run, name,
-              f"sudo {AGENT_DIR}/bin/wazuh-control status | head -8", capture=True)
+              f"sudo {adir}/bin/wazuh-control status | head -8", capture=True)
     return 0
 
 
-def apply_registration_password(cfg: Cfg, run: Runner, name: str, pw: str) -> int:
+def apply_registration_password(cfg: Cfg, run: Runner, name: str, inst: dict,
+                                pw: str) -> int:
     """Write authd.pass on a Linux agent and restart it.
 
     Ownership matters: wazuh-agentd runs as the `wazuh` user, so a root:root file is
     unreadable and the agent logs "No authentication password provided" as though the
     file were absent. The group is taken from the etc directory rather than hardcoded.
     """
+    adir = agent_dir(inst)
+    # BSD stat (macOS) has no -c; ask for the group with -f there.
+    grp = (f"$(stat -f %Sg {adir}/etc)" if inst.get("os") == "macos"
+           else f"$(stat -c %G {adir}/etc)")
     return guest_run(
         cfg, run, name,
-        f"printf '%s' '{pw}' | sudo tee {AGENT_DIR}/etc/authd.pass >/dev/null && "
-        f"sudo chown root:\"$(stat -c %G {AGENT_DIR}/etc)\" {AGENT_DIR}/etc/authd.pass && "
-        f"sudo chmod 640 {AGENT_DIR}/etc/authd.pass && "
-        f"sudo {AGENT_DIR}/bin/wazuh-control restart > /dev/null && echo enrolled",
+        f"printf '%s' '{pw}' | sudo tee {adir}/etc/authd.pass >/dev/null && "
+        f"sudo chown root:\"{grp}\" {adir}/etc/authd.pass && "
+        f"sudo chmod 640 {adir}/etc/authd.pass && "
+        f"sudo {adir}/bin/wazuh-control restart > /dev/null && echo enrolled",
         capture=True)
 
 
@@ -1066,19 +1144,22 @@ def v_enroll(cfg: Cfg, run: Runner, args) -> int:
     if not args.manager:
         die(2, f"enroll needs --manager <instance>")
     mgr_ip, mgr_pw = manager_secret(cfg, run, args.manager)
-    if inst.get("os") != "linux":
-        die(3, f"{name}: enroll covers Linux agents; on Windows reinstall the MSI "
-               "with --manager")
+    if inst.get("os") not in ("linux", "macos"):
+        die(3, f"{name}: enroll covers Linux and macOS agents; on Windows reinstall "
+               "the MSI with --manager")
     # Point the agent at the manager, then supply the password.
+    adir = agent_dir(inst)
+    # BSD sed needs an explicit backup suffix for -i.
+    sed_i = "sed -i ''" if inst.get("os") == "macos" else "sed -i"
     if guest_run(cfg, run, name,
-                 f"sudo sed -i 's|<address>.*</address>|<address>{mgr_ip}</address>|' "
-                 f"{AGENT_DIR}/etc/ossec.conf && echo addressed", capture=True):
+                 f"sudo {sed_i} 's|<address>.*</address>|<address>{mgr_ip}</address>|' "
+                 f"{adir}/etc/ossec.conf && echo addressed", capture=True):
         die(1, f"{name}: could not set the manager address")
-    if mgr_pw and apply_registration_password(cfg, run, name, mgr_pw):
+    if mgr_pw and apply_registration_password(cfg, run, name, inst, mgr_pw):
         die(1, f"{name}: could not apply the registration password")
     guest_run(cfg, run, name,
               f"sleep 8; sudo grep -E 'Valid key|Connected to the server' "
-              f"{AGENT_DIR}/logs/ossec.log | tail -3", capture=True)
+              f"{adir}/logs/ossec.log | tail -3", capture=True)
     return 0
 
 
