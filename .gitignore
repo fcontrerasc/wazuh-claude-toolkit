@@ -1,0 +1,7 @@
+# Third-party installers: fetched, never committed (see assets/README.md).
+assets/*
+!assets/README.md
+
+# Local scratch
+*.log
+.DS_Store

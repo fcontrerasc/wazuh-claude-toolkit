@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+"""vmx - one VM execution layer for every Wazuh build, test and repro.
+
+Backends: lima (Linux), tart (macOS), ssh-only (Windows, externally managed).
+Source reaches a guest by one-way rsync into a guest-local tree, never a shared
+mount: build artifacts land in the source tree (objects, src/build, src/external)
+so two VMs sharing one mount corrupt each other. Guest trees are independent,
+so builds run in parallel.
+
+Instances are named <component>-<os>-<arm|amd> and registered in .claude/vmx.toml.
+
+Verbs:
+  list                          backends, instances, state, arch, sync stamp
+  doctor   [INSTANCE]           host + guest prerequisites for a role
+  up       INSTANCE...          start (create if absent; bridged on create)
+  sync     INSTANCE             one-way host worktree -> guest tree
+  provision INSTANCE           install the build toolchain (apt + pinned cmake)
+  deps     INSTANCE [TARGET=..] make deps, once per VM per target
+  exec     INSTANCE -- CMD...   run in the guest tree
+  build    INSTANCE [VAR=..]    up + sync + make
+  test     INSTANCE [--ctest-filter RE]
+  winagent [--builder INSTANCE] [--packager INSTANCE] --issue N
+  fetch    INSTANCE GUEST_PATH... --issue N
+  collect  INSTANCE --issue N --from PATH...
+  install  INSTANCE MSI_OR_PKG
+
+Global: --json --dry-run --quiet --timeout S --record [--step NAME]
+
+Exit: 0 ok | 1 guest command failed | 2 bad config/target | 3 unsupported combo
+      4 VM absent and creation forbidden | 5 sync/mount unrepairable
+      6 timeout | 7 host prerequisite missing
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG = ".claude/vmx.toml"
+
+# Instance names carry a bare arm|amd (no 32-bit target is supported, so the 64 is
+# noise). Backends still want their own spelling.
+BACKEND_ARCH = {"arm64": "aarch64", "amd64": "x86_64"}
+
+# Never synced. Excluded paths are also protected from --delete, so guest-local
+# deps (src/external) and build caches (src/build) survive every resync.
+# src/external holds arch-specific `make deps` output, but two files in it are
+# tracked and the build needs them: src/external/CMakeLists.txt is added via
+# add_subdirectory (src/CMakeLists.txt:228), so excluding the whole directory
+# breaks configure with "does not contain a CMakeLists.txt file".
+INCLUDES = [
+    "/src/external/",
+    "/src/external/CMakeLists.txt",
+    "/src/external/.gitignore",
+]
+
+EXCLUDES = [
+    ".git/",
+    "docs/",
+    "/src/external/*",
+    "src/build/",
+    "src/var/",
+    "**/build/",
+    "*.o",
+    "*.a",
+    "*.so",
+    "*.dylib",
+    "compile_commands.json",
+    ".claude/",
+    "bin/",
+]
+
+
+def die(code: int, msg: str):
+    print(f"vmx: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def repo_root() -> Path:
+    try:
+        return Path(
+            subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        die(2, "not inside a git repository")
+
+
+def main_repo(root: Path) -> Path:
+    """The main checkout, even when called from a worktree."""
+    common = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return Path(common).parent if common else root
+
+
+class Cfg:
+    def __init__(self, root: Path):
+        p = root / CONFIG
+        if not p.is_file():
+            p = main_repo(root) / CONFIG
+        if not p.is_file():
+            die(2, f"missing {CONFIG}")
+        self.raw = tomllib.loads(p.read_text())
+        self.instances = self.raw.get("instances", {})
+        self.defaults = self.raw.get("defaults", {})
+
+    def resolve(self, target: str) -> tuple[str, dict]:
+        """Exact instance name, or a spec like linux/arm64 -> first match."""
+        if target in self.instances:
+            return target, self.instances[target]
+        parts = [p for p in target.replace("-", "/").split("/") if p]
+        for name, inst in self.instances.items():
+            fields = {inst.get("os", ""), inst.get("arch", ""), inst.get("distro", ""),
+                      inst.get("component", "")}
+            if all(p in fields for p in parts):
+                return name, inst
+        # Unsupported combinations are a hard error, never a silent fallback.
+        if "x86_64" in parts and ("macos" in parts or "windows" in parts):
+            die(3, f"{target}: x86_64 is not supported on macOS or Windows")
+        die(2, f"{target}: no instance matches (see: vmx list)")
+
+
+class Runner:
+    def __init__(self, args):
+        self.dry = args.dry_run
+        self.quiet = args.quiet
+        self.timeout = args.timeout
+
+    def sh(self, cmd: list[str], capture=True, check=False, stdin=None):
+        if self.dry:
+            print("+ " + " ".join(shlex.quote(c) for c in cmd))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if not self.quiet and not capture:
+            print("+ " + " ".join(shlex.quote(c) for c in cmd), file=sys.stderr)
+        return subprocess.run(
+            cmd, capture_output=capture, text=True, check=check,
+            timeout=self.timeout, input=stdin,
+        )
+
+
+# --------------------------------------------------------------------------
+# backends
+# --------------------------------------------------------------------------
+
+
+def lima_state(run: Runner, name: str) -> str:
+    r = run.sh(["limactl", "list", "--json"])
+    for line in r.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("name") == name:
+            return d.get("status", "unknown").lower()
+    return "absent"
+
+
+def tart_state(run: Runner, name: str) -> str:
+    r = run.sh(["tart", "list", "--format", "json"])
+    try:
+        for d in json.loads(r.stdout or "[]"):
+            if d.get("Name") == name:
+                return d.get("State", "unknown").lower()
+    except json.JSONDecodeError:
+        pass
+    return "absent"
+
+
+def ssh_reachable(run: Runner, host: str, port: int) -> str:
+    r = run.sh(["nc", "-z", "-G", "3", host, str(port)])
+    return "ssh-ok" if r.returncode == 0 else "unreachable"
+
+
+def state_of(run: Runner, name: str, inst: dict) -> str:
+    b = inst.get("backend")
+    if b == "lima":
+        return lima_state(run, inst.get("instance", name))
+    if b == "tart":
+        return tart_state(run, inst.get("instance", name))
+    if b == "ssh":
+        return ssh_reachable(run, inst.get("host", "localhost"), int(inst.get("port", 22)))
+    die(2, f"{name}: unknown backend {b!r}")
+
+
+def identity_args(inst: dict) -> list[str]:
+    """-i for a dedicated automation key, so nothing depends on ssh-agent state."""
+    key = inst.get("identity_file")
+    if not key:
+        return []
+    return ["-i", os.path.expanduser(key), "-o", "IdentitiesOnly=yes"]
+
+
+def ssh_cmd(name: str, inst: dict) -> list[str]:
+    """Argv prefix that runs a command in the guest."""
+    b = inst["backend"]
+    if b == "lima":
+        i = inst.get("instance", name)
+        cfg = Path.home() / ".lima" / i / "ssh.config"
+        if not cfg.is_file():
+            die(4, f"{name}: lima instance not started (no {cfg})")
+        return ["ssh", "-F", str(cfg), f"lima-{i}"]
+    if b == "tart":
+        ip = subprocess.run(
+            ["tart", "ip", inst.get("instance", name)], capture_output=True, text=True
+        ).stdout.strip()
+        if not ip:
+            die(4, f"{name}: tart VM has no IP (not running?)")
+        return (["ssh", "-o", "StrictHostKeyChecking=no"] + identity_args(inst)
+                + [f"{inst['user']}@{ip}"])
+    if b == "ssh":
+        return (
+            # Keepalives: a VS Build Tools install runs for tens of minutes with no
+            # output, and an idle drop would kill it halfway.
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=240",
+             "-p", str(inst.get("port", 22))]
+            + identity_args(inst)
+            + [f"{inst['user']}@{inst.get('host', 'localhost')}"]
+        )
+    die(2, f"unknown backend {b!r}")
+
+
+_GUEST_HOME: dict[str, str] = {}
+
+
+def guest_home(name: str, inst: dict) -> str:
+    """Absolute home directory in the guest, resolved once per run.
+
+    Neither `~` nor `$HOME` survives the trip: ssh quoting, rsync's remote-path
+    quoting and scp all treat them as literal text at least some of the time, which
+    silently produces a directory actually named `~` or `$HOME`. An absolute path
+    removes the ambiguity everywhere.
+    """
+    if name not in _GUEST_HOME:
+        r = subprocess.run(ssh_cmd(name, inst) + ['printf %s "$HOME"'],
+                           capture_output=True, text=True)
+        home = r.stdout.strip()
+        if not home:
+            die(5, f"{name}: cannot resolve the guest home directory")
+        _GUEST_HOME[name] = home
+    return _GUEST_HOME[name]
+
+
+def guest_tree(name: str, inst: dict, root: Path) -> str:
+    """Absolute guest path of the synced tree."""
+    base = inst.get("guest_root", "~/wz")
+    if base.startswith("~/"):
+        base = f"{guest_home(name, inst)}/{base[2:]}"
+    return f"{base}/{root.name}"
+
+
+def default_bridge() -> str:
+    """Host interface carrying the default route.
+
+    lima's stock `bridged` network binds en0, which is dead on a host whose LAN
+    lives on en1 - the bridged NIC then comes up with no DHCP lease at all.
+    """
+    out = subprocess.run(["route", "-n", "get", "default"],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if "interface:" in line:
+            return line.split(":", 1)[1].strip()
+    return "en0"
+
+
+def lima_bridge_iface() -> str:
+    """Host interface lima's `bridged` network is bound to."""
+    cfg = Path.home() / ".lima/_config/networks.yaml"
+    if not cfg.is_file():
+        return ""
+    in_bridged = False
+    for line in cfg.read_text().splitlines():
+        if re.match(r"^\s{2}bridged:\s*$", line):
+            in_bridged = True
+            continue
+        if in_bridged:
+            m = re.match(r"^\s+interface:\s*(\S+)", line)
+            if m:
+                return m.group(1)
+            if re.match(r"^\s{2}\S", line):
+                break
+    return ""
+
+
+def scp_cmd(inst: dict) -> tuple[list[str], str]:
+    """scp argv prefix and remote spec.
+
+    Windows guests have OpenSSH but no rsync, so file transfer there is scp.
+    They never need a source tree anyway: no compiler, packaging only.
+    """
+    return (
+        ["scp", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+         "-P", str(inst.get("port", 22))] + identity_args(inst),
+        f"{inst['user']}@{inst.get('host', 'localhost')}",
+    )
+
+
+def pull(run: Runner, name: str, inst: dict, remote_path: str, dest: Path) -> int:
+    """Copy a guest path to the host, using whatever transport the guest has."""
+    if inst["backend"] == "ssh":
+        pre, spec = scp_cmd(inst)
+        # Windows paths arrive with backslashes; scp treats those as escapes, so the
+        # transfer silently fetches nothing. OpenSSH on Windows accepts forward
+        # slashes, including after a drive letter.
+        remote_path = remote_path.replace("\\", "/")
+        return run.sh(pre + ["-r", f"{spec}:{remote_path}", str(dest)],
+                      capture=False).returncode
+    ssh = ssh_cmd(name, inst)
+    return run.sh([rsync_bin(), "-a", "-e", " ".join(shlex.quote(c) for c in ssh[:-1]),
+                   f"{ssh[-1]}:{remote_path}", f"{dest}/"], capture=False).returncode
+
+
+def push(run: Runner, name: str, inst: dict, local: Path, remote_path: str) -> int:
+    if inst["backend"] == "ssh":
+        pre, spec = scp_cmd(inst)
+        return run.sh(pre + [str(local), f"{spec}:{remote_path}"],
+                      capture=False).returncode
+    ssh = ssh_cmd(name, inst)
+    return run.sh([rsync_bin(), "-a", "-e", " ".join(shlex.quote(c) for c in ssh[:-1]),
+                   str(local), f"{ssh[-1]}:{remote_path}"], capture=False).returncode
+
+
+# --------------------------------------------------------------------------
+# verbs
+# --------------------------------------------------------------------------
+
+
+def v_list(cfg: Cfg, run: Runner, args) -> int:
+    rows = []
+    for name, inst in cfg.instances.items():
+        rows.append({
+            "instance": name,
+            "backend": inst.get("backend", "?"),
+            "component": inst.get("component", "-"),
+            "os": inst.get("os", "?"),
+            "arch": inst.get("arch", "?"),
+            "state": state_of(run, name, inst),
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    w = max([len(r["instance"]) for r in rows] + [8])
+    print(f"{'INSTANCE':<{w}}  {'BACKEND':<8} {'COMPONENT':<9} {'OS':<8} {'ARCH':<8} STATE")
+    for r in rows:
+        print(f"{r['instance']:<{w}}  {r['backend']:<8} {r['component']:<9} "
+              f"{r['os']:<8} {r['arch']:<8} {r['state']}")
+    return 0
+
+
+def rsync_bin(required: bool = True) -> str | None:
+    """rsync 3.x only: macOS ships openrsync, whose filter/delete semantics differ."""
+    for cand in ("/opt/homebrew/bin/rsync", "/usr/local/bin/rsync", shutil.which("rsync")):
+        if not cand or not Path(cand).exists():
+            continue
+        v = subprocess.run([cand, "--version"], capture_output=True, text=True).stdout
+        if "openrsync" not in v.split("\n")[0]:
+            return cand
+    if not required:
+        return None
+    die(7, "rsync 3.x required (macOS ships openrsync). Run: brew install rsync")
+
+
+def v_up(cfg: Cfg, run: Runner, args) -> int:
+    for target in args.targets:
+        name, inst = cfg.resolve(target)
+        st = state_of(run, name, inst)
+        b = inst["backend"]
+        already = st in ("running", "ssh-ok")
+
+        if not already:
+            if b == "ssh":
+                die(4, f"{name}: externally managed VM is not reachable - start it by hand")
+            if st == "absent":
+                if not inst.get("create", True):
+                    die(4, f"{name}: absent and creation disabled")
+                create(run, name, inst)
+
+        if b == "lima":
+            if not already:
+                r = run.sh(["limactl", "start", inst.get("instance", name)], capture=False)
+                if r.returncode:
+                    die(5, f"{name}: limactl start failed ({r.returncode}) - see the "
+                           "message above; `vmx doctor` covers the common causes")
+            # lima names the guest lima-<instance>; evidence transcripts must show
+            # the instance name. Enforced whether or not this call started the VM,
+            # so a VM brought up by hand still converges.
+            if not run.dry:
+                run.sh(ssh_cmd(name, inst)
+                       + [f"sudo hostnamectl set-hostname {shlex.quote(name)}"])
+        elif b == "tart" and not already:
+            # Bridged for visibility; detached so the VM outlives this process.
+            net = inst.get("bridge", default_bridge())
+            cmd = ["tart", "run", inst.get("instance", name), "--no-graphics",
+                   f"--net-bridged={net}"]
+            if run.dry:
+                print("+ " + " ".join(cmd) + " &")
+            else:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"{name}: up")
+    return 0
+
+
+def create(run: Runner, name: str, inst: dict):
+    b = inst["backend"]
+    if b == "lima":
+        tmpl = inst.get("template", "template://ubuntu-22.04")
+        arch = BACKEND_ARCH.get(inst["arch"], inst["arch"])
+        cmd = ["limactl", "create", f"--name={inst.get('instance', name)}",
+               f"--arch={arch}", "--tty=false",
+               # lima defaults the guest user to the host username; these guests
+               # run wazuh so paths and logs match the product's own environment.
+               f'--set=.user.name="{inst.get("user", "wazuh")}"',
+               # Templates mount the host home by default. Source arrives by rsync
+               # into a guest-local tree, so a host mount is only a way to build
+               # from the wrong copy - drop it.
+               "--set=.mounts=[]",
+               # Bridged is mandatory on create: a NAT-only VM that looks fine is
+               # the trap this rule exists to prevent. An instance can only
+               # reference a *named* lima network, so which host interface the
+               # bridge binds lives in ~/.lima/_config/networks.yaml - checked
+               # below, because a wrong interface yields a NIC with no DHCP lease.
+               "--network=lima:bridged",
+               f"--cpus={inst.get('cpus', 4)}",
+               f"--memory={inst.get('memory', 8)}",
+               f"--disk={inst.get('disk', 100)}",
+               tmpl]
+        if not (Path("/opt/socket_vmnet/bin/socket_vmnet").exists()
+                or Path("/opt/homebrew/opt/socket_vmnet").exists()):
+            die(7, "lima bridged needs socket_vmnet (brew install socket_vmnet)")
+        want, have = default_bridge(), lima_bridge_iface()
+        if have != want:
+            die(7, f"lima bridged is bound to {have!r} but the LAN is on {want!r}; "
+                   f"the VM would get no DHCP lease. Fix ~/.lima/_config/networks.yaml:\n"
+                   f"  networks.bridged.interface: {want}")
+        run.sh(cmd, capture=False, check=True)
+    elif b == "tart":
+        base = inst.get("image")
+        if not base:
+            die(2, f"{name}: tart instance needs an `image` to clone from")
+        run.sh(["tart", "clone", base, inst.get("instance", name)],
+               capture=False, check=True)
+    else:
+        die(4, f"{name}: creation not supported for backend {b}")
+
+
+def v_sync(cfg: Cfg, run: Runner, args) -> int:
+    name, inst = cfg.resolve(args.targets[0])
+    if inst["backend"] == "ssh":
+        # Windows guests have no rsync and no compiler: they receive a built zip
+        # via scp (see `winagent`), never a source tree.
+        die(3, f"{name}: no tree sync for Windows - use `vmx winagent` / `vmx fetch`")
+    root = repo_root()
+    dest = guest_tree(name, inst, root)
+    rs = rsync_bin()
+    ssh = " ".join(shlex.quote(c) for c in ssh_cmd(name, inst)[:-1])
+    remote = ssh_cmd(name, inst)[-1]
+
+    run.sh(ssh_cmd(name, inst) + [f'mkdir -p "{dest}"'], check=False)
+    cmd = [rs, "-a", "--delete", "-e", ssh]
+    # Includes must precede excludes: rsync takes the first matching rule.
+    for i in INCLUDES:
+        cmd += ["--include", i]
+    for e in EXCLUDES:
+        cmd += ["--exclude", e]
+    cmd += [f"{root}/", f"{remote}:{dest}/"]
+    r = run.sh(cmd, capture=False)
+    if r.returncode != 0:
+        mk = run.sh(ssh_cmd(name, inst) + [f'mkdir -p "{dest}"'])
+        if mk.returncode:
+            die(5, f"{name}: cannot create {dest}: {mk.stderr.strip()}")
+        r = run.sh(cmd, capture=False)
+    if r.returncode != 0:
+        die(5, f"{name}: rsync failed ({r.returncode})")
+    # Stamp so `list` and later verbs can tell what the guest tree holds.
+    commit = subprocess.run(["git", "rev-parse", "--short=7", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    run.sh(ssh_cmd(name, inst)
+           + [f'printf "%s %s\\n" {commit} {utc_stamp()} > "{dest}/.vmx-sync"'])
+    print(f"{name}: synced {root.name} @ {commit} -> {dest}")
+    return 0
+
+
+def guest_run(cfg: Cfg, run: Runner, target: str, script: str, record=None,
+              step=None, capture=False) -> int:
+    """Run a shell snippet in the guest tree. --record writes a transcript."""
+    name, inst = cfg.resolve(target)
+    root = repo_root()
+    # Windows guests hold no source tree and use a different shell, so commands
+    # run as given rather than being wrapped in a `cd` into the guest tree.
+    if inst.get("os") == "windows":
+        wrapped = script
+    else:
+        # mkdir first: exec must work on a fresh VM, before any sync has run.
+        # Double quotes, never shlex.quote: the path contains $HOME and a
+        # single-quoted tilde or $HOME becomes a literal directory name.
+        tree = guest_tree(name, inst, root)
+        wrapped = f'mkdir -p "{tree}" && cd "{tree}" && {script}'
+    argv = ssh_cmd(name, inst) + [wrapped]
+
+    if record:
+        r = run.sh(argv, capture=True)
+        user = inst.get("user", "root")
+        prompt = f"{user}@{name}:~#"
+        text = f"{prompt} {script}\n{r.stdout}{r.stderr}"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        with record.open("a") as fh:
+            if step:
+                fh.write(f"\n### {step}\n")
+            fh.write(text if text.endswith("\n") else text + "\n")
+        print(text, end="")
+        return r.returncode
+    r = run.sh(argv, capture=capture)
+    if capture:
+        print(r.stdout, end="")
+        if r.returncode != 0:
+            print(r.stderr, end="", file=sys.stderr)
+    return r.returncode
+
+
+def v_exec(cfg: Cfg, run: Runner, args) -> int:
+    if not args.cmd:
+        die(2, "exec needs: vmx exec INSTANCE -- CMD...")
+    record = Path(args.record) if args.record else None
+    rc = guest_run(cfg, run, args.targets[0], " ".join(args.cmd),
+                   record=record, step=args.step, capture=bool(record) is False)
+    return 1 if rc else 0
+
+
+def make_flags(vars_: list[str]) -> str:
+    return " ".join(vars_)
+
+
+# Packages taken from .github/workflows/5_builderpackage_agent-windows.yml and
+# packages/windows/Dockerfile.
+#
+# cmake comes from apt when it is new enough. The repo's highest
+# cmake_minimum_required is 3.22.1, and Ubuntu 24.04 ships 3.28, so apt satisfies
+# it; CI's 3.31.6 pin exists because the CodeBuild images ship no cmake at all
+# ("TODO(codebuild-temp): Remove when CodeBuild base images ship cmake"), not
+# because 3.28 is too old. Only fall back to building from source if apt is older
+# than the minimum - a source cmake build costs minutes for nothing.
+PROVISION_APT = [
+    "build-essential", "make", "cmake", "gcc", "g++", "gcc-mingw-w64", "g++-mingw-w64",
+    "zip", "unzip", "curl", "wget", "perl", "binutils", "libssl-dev", "jq",
+    "astyle", "python3", "python3-pip", "git", "ccache",
+]
+CMAKE_MIN = "3.22.1"   # highest cmake_minimum_required under src/
+
+
+# Where generate_wazuh_msi.ps1 finds candle.exe/light.exe. The installer's own
+# default location; passed to the script as -WIX_TOOLS_PATH so nothing depends on
+# the guest PATH (setx /M needs elevation an ssh session does not have).
+WIX_BIN = r"C:\Program Files (x86)\WiX Toolset v3.14\bin"
+
+
+def v_provision(cfg: Cfg, run: Runner, args) -> int:
+    """Install the toolchain a Wazuh build needs. Idempotent; no cleanup."""
+    name, inst = cfg.resolve(args.targets[0])
+    if inst.get("os") == "windows":
+        return provision_windows(cfg, run, name, inst)
+    if inst.get("os") != "linux":
+        die(3, f"{name}: provision covers Linux and Windows guests")
+    pkgs = " ".join(PROVISION_APT)
+    script = (
+        "set -e; export DEBIAN_FRONTEND=noninteractive; "
+        "sudo apt-get update -qq; "
+        f"sudo apt-get install -y -qq {pkgs} >/dev/null; "
+        # apt cmake if it meets the minimum; otherwise the repo's own installer
+        # (never a second implementation of it).
+        f"cur=$(cmake --version 2>/dev/null | awk 'NR==1{{print $3}}'); "
+        f'if [ -z "$cur" ] || [ "$(printf "%s\\n{CMAKE_MIN}" "$cur" '
+        f'| sort -V | head -1)" != "{CMAKE_MIN}" ]; then '
+        f'  echo "apt cmake $cur < {CMAKE_MIN}, building from source"; '
+        f"  sudo bash tools/devContainer/reinstall-cmake.sh {CMAKE_MIN} >/dev/null; "
+        "fi; "
+        "echo provisioned: $(cmake --version | head -1), "
+        "$(i686-w64-mingw32-g++-posix --version | head -1)"
+    )
+    rc = guest_run(cfg, run, name, script, capture=True)
+    return 1 if rc else 0
+
+
+def v_deps(cfg: Cfg, run: Runner, args) -> int:
+    tgt = next((v for v in args.vars if v.startswith("TARGET=")), "TARGET=manager")
+    rc = guest_run(cfg, run, args.targets[0],
+                   f"make -C src deps {tgt} -j$(nproc)", capture=True)
+    if rc:
+        return 1
+    return 0 if fix_host_tools(cfg, run, args.targets[0]) == 0 else 1
+
+
+def win_packager(cfg: Cfg, run: Runner, name: str, inst: dict,
+                 action: str = "check", asset: Path | None = None,
+                 symbols: bool = False) -> dict:
+    """Run .claude/setup/win-packager.ps1 in the guest and parse KEY=OK/MISS.
+
+    Pushed as a file and run with -File: inline `powershell -Command` through
+    ssh -> cmd loses its quoting, comes back echoed and exits 0, which reads as a
+    false success.
+    """
+    root = main_repo(repo_root())
+    ps1 = root / ".claude/setup/win-packager.ps1"
+    if not ps1.is_file():
+        die(2, f"missing {ps1}")
+    if push(run, name, inst, ps1, "C:/Users/wazuh/win-packager.ps1"):
+        die(1, f"{name}: could not copy win-packager.ps1")
+
+    cmd = ("powershell -ExecutionPolicy Bypass -File C:/Users/wazuh/win-packager.ps1 "
+           f"-Action {action}")
+    if symbols:
+        cmd += " -Symbols"
+    if asset is not None:
+        remote = f"C:/Users/wazuh/{asset.name}"
+        if push(run, name, inst, asset, remote):
+            die(1, f"{name}: could not copy {asset.name}")
+        cmd += f" -Asset {remote}"
+
+    r = run.sh(ssh_cmd(name, inst) + [cmd])
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out.strip())
+    found = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.strip().partition("=")
+            found[k] = v
+    return found
+
+
+def provision_windows(cfg: Cfg, run: Runner, name: str, inst: dict) -> int:
+    """Install the MSI packaging prerequisites on the Windows guest."""
+    want_symbols = getattr(cfg, "want_symbols", False)
+    state = win_packager(cfg, run, name, inst, "check")
+    needed = ("candle", "light", "cv2pdb") + (("mspdb32",) if want_symbols else ())
+    if all(state.get(k, "MISS").startswith("OK") for k in needed):
+        print(f"{name}: packaging tools already present")
+        return 0
+
+    assets = Path(os.path.expanduser(
+        cfg.defaults.get("assets_dir", "~/.local/share/vmx/assets")))
+    # The binaries zip is preferred: extracting needs no elevation, which an ssh
+    # session does not have. The .exe bundle also wants .NET Framework 3.5.
+    asset = next((a for a in (assets / "wix314-binaries.zip", assets / "wix314.exe")
+                  if a.is_file()), None)
+    if asset is None and not state.get("candle", "MISS").startswith("OK"):
+        die(7, f"{name}: no WiX asset in {assets}\n"
+               "  preferred: wix314-binaries.zip (no install, no elevation)\n"
+               "  fallback:  wix314.exe (needs .NET 3.5 + elevation)")
+
+    state = win_packager(cfg, run, name, inst, "install", asset,
+                         symbols=want_symbols)
+    if not state.get("candle", "MISS").startswith("OK"):
+        die(1, f"{name}: WiX still missing after installing {asset.name}. The .exe "
+               "bundle needs an elevated session and .NET Framework 3.5 - run it "
+               "once from the VM console, or put wix314-binaries.zip in the assets "
+               "dir and re-run.")
+    print(f"{name}: WiX ready")
+    return 0
+
+
+def fix_host_tools(cfg: Cfg, run: Runner, target: str) -> int:
+    """Rebuild deps host tools that the bundle ships for the wrong architecture.
+
+    The published deps bundles are produced on amd64 CI hosts, so `flatc` arrives
+    as an x86-64 ELF. It is a *host* tool (it generates headers during the build),
+    so on an arm64 guest the build dies with `Exec format error` / make Error 126.
+    The flatbuffers sources are in the bundle, so rebuild it natively.
+    """
+    script = (
+        "F=src/external/flatbuffers/build/flatc; "
+        "[ -x \"$F\" ] && \"$F\" --version >/dev/null 2>&1 && "
+        "{ echo 'host tools OK'; exit 0; }; "
+        "cd src/external/flatbuffers && "
+        # make deps re-copies the bundle's x86-64 flatc over build/flatc on every
+        # run, so a previously built native binary is kept in build-native/ and
+        # simply reinstalled.
+        "if [ -x build-native/flatc ] && build-native/flatc --version >/dev/null 2>&1; "
+        "then cp build-native/flatc build/flatc; "
+        "echo 'reinstalled native flatc'; build/flatc --version; exit 0; fi; "
+        "echo 'flatc is not runnable on this arch; rebuilding from bundled source'; "
+        # Never reuse the bundle's build/: it ships a CMakeCache.txt generated at
+        # /wazuh-local-src inside Wazuh's own build container, which cmake refuses
+        # to reuse from any other path. Configure out-of-tree, then drop the binary
+        # where the Wazuh build looks for it.
+        "cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release "
+        "-DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF "
+        "-DFLATBUFFERS_BUILD_FLATHASH=OFF > /tmp/vmx-flatc.log 2>&1 && "
+        "cmake --build build-native --target flatc -j$(nproc) "
+        ">> /tmp/vmx-flatc.log 2>&1 || "
+        "{ tail -20 /tmp/vmx-flatc.log; exit 1; }; "
+        "mkdir -p build && cp build-native/flatc build/flatc && "
+        "build/flatc --version"
+    )
+    return guest_run(cfg, run, target, script, capture=True)
+
+
+FAIL_PAT = "error:|Error [0-9]|FAILED|undefined reference|No rule to make target"
+
+
+def v_build(cfg: Cfg, run: Runner, args) -> int:
+    name, inst = cfg.resolve(args.targets[0])
+    if inst.get("os") == "windows":
+        die(3, f"{name}: Windows has no compiler here - use `vmx winagent`")
+    v_up(cfg, run, argparse.Namespace(**{**vars(args), "targets": [name]}))
+    v_sync(cfg, run, argparse.Namespace(**{**vars(args), "targets": [name]}))
+    flags = make_flags(args.vars) or "TARGET=agent"
+    # Quiet on success; on failure print only the lines that explain it.
+    script = (
+        f"make -C src {flags} -j$(nproc) > /tmp/vmx-build.log 2>&1; rc=$?; "
+        f"if [ $rc -ne 0 ]; then grep -nE '{FAIL_PAT}' /tmp/vmx-build.log | tail -40; fi; "
+        "exit $rc"
+    )
+    rc = guest_run(cfg, run, name, script, capture=True)
+    result = {"instance": name, "os": inst.get("os"), "arch": inst.get("arch"),
+              "flags": flags, "exit": rc}
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(f"{name}: build {'OK' if rc == 0 else 'FAILED'} ({flags})")
+    return 1 if rc else 0
+
+
+def v_test(cfg: Cfg, run: Runner, args) -> int:
+    name, _ = cfg.resolve(args.targets[0])
+    filt = f"-R {shlex.quote(args.ctest_filter)}" if args.ctest_filter else ""
+    script = (
+        "cd src/unit_tests && mkdir -p build && cd build && "
+        "cmake -DTARGET=manager .. > /tmp/vmx-cmake.log 2>&1 && "
+        "make -j$(nproc) > /tmp/vmx-utbuild.log 2>&1 && "
+        f"ctest {filt} --output-on-failure"
+    )
+    rc = guest_run(cfg, run, name, script, capture=True)
+    if args.json:
+        print(json.dumps({"instance": name, "filter": args.ctest_filter, "exit": rc}))
+    return 1 if rc else 0
+
+
+def v_winagent(cfg: Cfg, run: Runner, args) -> int:
+    """Two stages: MinGW cross-build on Linux, MSI packaging on Windows.
+
+    Mirrors .github/workflows/5_builderpackage_agent-windows.yml, not the docker
+    script in packages/windows: that one requires .git in the source tree, which
+    sync deliberately excludes. The commit is injected from the host instead.
+    """
+    root = repo_root()
+    bname, binst = cfg.resolve(args.builder or "builder-ubuntu-arm")
+    pname, pinst = cfg.resolve(args.packager or "agent-win11-arm")
+    commit = subprocess.run(["git", "rev-parse", "--short=7", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    version = json.loads((root / "VERSION.json").read_text())["version"]
+    rev = args.revision or "0"
+    stem = f"wazuh-agent_{version}-{rev}_windows_{commit}"
+
+    dbg = "DEBUG=1" if args.debug else ""
+    skip1 = args.stage2_only
+
+    if not skip1:
+        v_up(cfg, run, argparse.Namespace(**{**vars(args), "targets": [bname]}))
+        v_sync(cfg, run, argparse.Namespace(**{**vars(args), "targets": [bname]}))
+
+    # Deps first, then repair host tools, then build: `make deps` ships an x86-64
+    # flatc that cannot run on arm64, and it rewrites build/flatc every run.
+    if not skip1:
+        if guest_run(cfg, run, bname,
+                     f"make -C src deps TARGET=winagent {dbg} -j$(nproc) "
+                     "> /tmp/vmx-wa-deps.log 2>&1 || "
+                     "{ tail -20 /tmp/vmx-wa-deps.log; exit 1; }", capture=True):
+            die(1, f"{bname}: winagent deps failed")
+        if fix_host_tools(cfg, run, bname):
+            die(1, f"{bname}: could not make the deps host tools runnable")
+
+    stage1 = (
+        # VERSION.json needs the commit field; the guest has no .git, so patch it here.
+        f"""sed -i '/"stage":/s/$/,/; /"stage":/a \\    "commit": "{commit}"' VERSION.json && """
+        # Log to the guest and surface only explanatory lines: a failing
+        # cross-build otherwise returns thousands of lines or, worse, none.
+        f"make -C src TARGET=winagent {dbg} -j$(nproc) "
+        f"> /tmp/vmx-winagent.log 2>&1 || {{ "
+        f"grep -nE '{FAIL_PAT}|CMake Error' /tmp/vmx-winagent.log | tail -30; "
+        f"exit 1; }}; "
+        # entrypoint.sh drops src/external before zipping; the arch-specific deps
+        # are useless to the packager and huge.
+        f"rm -rf src/external && cd .. && zip -qr ~/{stem}.zip {root.name} && "
+        f"echo ~/{stem}.zip"
+    )
+    if not skip1:
+        if guest_run(cfg, run, bname, stage1, capture=True):
+            die(1, f"{bname}: winagent stage 1 failed")
+        print(f"stage 1 OK: {stem}.zip on {bname}")
+    print(f"stage 2 (packaging on {pname}) requires: WiX v3.14, .NET 4.8.1, "
+          f"Windows SDK, cv2pdb 0.52, 32-bit mspdb*.dll on PATH")
+    print(f"  vmx doctor {pname}   # verify before packaging")
+    if args.stage1_only:
+        return 0
+
+    # Stage 2: zip -> Windows -> MSI. Routed through the host because only the host
+    # holds the automation key; a guest-to-guest hop would mean putting a private
+    # key on the builder.
+    local_zip = root / "docs" / str(args.issue or "artifacts") / "artifacts" / f"{stem}.zip"
+    local_zip.parent.mkdir(parents=True, exist_ok=True)
+    if not local_zip.is_file():
+        if pull(run, bname, binst, f"~/{stem}.zip", local_zip.parent):
+            die(1, f"{bname}: could not fetch {stem}.zip")
+
+    remote_zip = f"{pinst.get('guest_root', 'C:/wz')}/{stem}.zip"
+    if guest_run(cfg, run, pname, f'mkdir "{pinst.get("guest_root", "C:/wz")}" 2>nul & '
+                                  "echo ready"):
+        pass  # mkdir is advisory: the directory may already exist
+    if push(run, pname, pinst, local_zip, remote_zip):
+        die(1, f"{pname}: could not upload {stem}.zip")
+
+    ps1 = main_repo(root) / ".claude/setup/win-msi.ps1"
+    if push(run, pname, pinst, ps1, "C:/Users/wazuh/win-msi.ps1"):
+        die(1, f"{pname}: could not copy win-msi.ps1")
+
+    cmd = ("powershell -ExecutionPolicy Bypass -File C:/Users/wazuh/win-msi.ps1 "
+           f"-Zip {remote_zip} -MsiName {stem}.msi")
+    r = run.sh(ssh_cmd(pname, pinst) + [cmd])
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out.strip()[-4000:])
+    got = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    if got.get("msi", "MISS") == "MISS":
+        die(1, f"{pname}: MSI was not produced")
+
+    # Bring the package back next to the issue's other artifacts.
+    if pull(run, pname, pinst, got["msi"], local_zip.parent):
+        die(1, f"{pname}: MSI built at {got['msi']} but could not be fetched")
+    print(f"MSI -> {local_zip.parent}/{stem}.msi ({got.get('msi_bytes', '?')} bytes)")
+    if got.get("symbols", "MISS") != "MISS":
+        pull(run, pname, pinst, got["symbols"], local_zip.parent)
+    else:
+        print("debug symbols: not produced (mspdb32 missing - see vmx doctor)")
+    return 0
+
+
+def v_install(cfg: Cfg, run: Runner, args) -> int:
+    """Install a built package on a guest, then report the service state."""
+    name, inst = cfg.resolve(args.targets[0])
+    pkg = Path(args.targets[1]) if len(args.targets) > 1 else None
+    if pkg is None or not pkg.is_file():
+        die(2, "install needs a local package: vmx install INSTANCE <file.msi>")
+    if inst.get("os") != "windows":
+        die(3, f"{name}: install currently covers Windows guests only")
+
+    remote = f"C:/Users/{inst['user']}/{pkg.name}"
+    if push(run, name, inst, pkg, remote):
+        die(1, f"{name}: could not upload {pkg.name}")
+    # /qn keeps it non-interactive; msiexec returns 3010 when a reboot is pending.
+    rc = guest_run(cfg, run, name,
+                   f'msiexec /i "{remote.replace("/", chr(92))}" /qn /l*v '
+                   'C:\\Users\\%USERNAME%\\msi-install.log', capture=True)
+    if rc not in (0, 3010):
+        die(1, f"{name}: msiexec failed ({rc}); log at C:/Users/{inst['user']}/msi-install.log")
+    guest_run(cfg, run, name, "sc query WazuhSvc", capture=True)
+    return 0
+
+
+def v_fetch(cfg: Cfg, run: Runner, args) -> int:
+    name, inst = cfg.resolve(args.targets[0])
+    root = repo_root()
+    out = root / "docs" / str(args.issue) / "artifacts"
+    out.mkdir(parents=True, exist_ok=True)
+    for p in args.from_ or args.cmd or args.targets[1:]:
+        if pull(run, name, inst, p, out):
+            die(1, f"{name}: fetch failed for {p}")
+    print(f"{name}: fetched -> {out}")
+    return 0
+
+
+def v_collect(cfg: Cfg, run: Runner, args) -> int:
+    """Evidence plus provenance: un-provenanced evidence is unreproducible."""
+    name, inst = cfg.resolve(args.targets[0])
+    root = repo_root()
+    dest = root / "docs" / str(args.issue) / "evidence" / name / utc_stamp()
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in args.from_:
+        pull(run, name, inst, p, dest)
+    probe = ("cmd /c ver" if inst.get("os") == "windows" else "uname -a")
+    uname = run.sh(ssh_cmd(name, inst) + [probe]).stdout.strip()
+    commit = subprocess.run(["git", "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "status", "--porcelain"],
+                                capture_output=True, text=True).stdout.strip())
+    (dest / "manifest.json").write_text(json.dumps({
+        "instance": name, "backend": inst.get("backend"), "os": inst.get("os"),
+        "arch": inst.get("arch"), "uname": uname, "commit": commit, "dirty": dirty,
+        "collected_utc": utc_stamp(), "sources": args.from_,
+    }, indent=2))
+    print(f"{name}: evidence -> {dest}")
+    return 0
+
+
+def v_doctor(cfg: Cfg, run: Runner, args) -> int:
+    ok = True
+
+    def check(label: str, good: bool, hint: str = ""):
+        nonlocal ok
+        print(f"  {'OK  ' if good else 'MISS'} {label}" + ("" if good else f"  -> {hint}"))
+        ok = ok and good
+
+    print("host:")
+    check("rsync 3.x", rsync_bin(required=False) is not None, "brew install rsync")
+    # An encrypted key with an empty agent makes every non-interactive ssh prompt,
+    # which reads as "Permission denied" under BatchMode. Check the agent, not the key.
+    agent = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
+    check("ssh-agent has an identity", "no identities" not in agent.stdout.lower()
+          and agent.returncode == 0,
+          "ssh-add --apple-use-keychain ~/.ssh/id_ed25519")
+    check("limactl", shutil.which("limactl") is not None, "brew install lima")
+    check("tart", shutil.which("tart") is not None, "brew install cirruslabs/cli/tart")
+    check("socket_vmnet (lima bridged)",
+          Path("/opt/socket_vmnet/bin/socket_vmnet").exists(),
+          "brew install socket_vmnet")
+    want, have = default_bridge(), lima_bridge_iface()
+    check(f"lima bridged -> {want} (LAN)", have == want,
+          f"set networks.bridged.interface: {want} in ~/.lima/_config/networks.yaml "
+          f"(currently {have or 'unset'})")
+    sudoers_ok = subprocess.run(["limactl", "sudoers", "--check"],
+                                capture_output=True, text=True).returncode == 0
+    check("lima sudoers in sync", sudoers_ok,
+          "limactl sudoers > /tmp/lima_sudoers && "
+          "sudo install -o root /tmp/lima_sudoers /private/etc/sudoers.d/lima")
+    free_gb = shutil.disk_usage("/System/Volumes/Data").free / 2**30
+    # A synced tree plus deps plus build output runs several GB per VM, and lima
+    # disks grow sparsely into whatever is left.
+    check(f"free disk {free_gb:.0f}GiB (>=20 for one build VM)", free_gb >= 20,
+          "free space before creating or building in a VM")
+    check("markdownlint", shutil.which("markdownlint") is not None,
+          "npm i -g markdownlint-cli")
+
+    for target in args.targets or []:
+        name, inst = cfg.resolve(target)
+        st = state_of(run, name, inst)
+        print(f"{name} ({inst.get('backend')}, {inst.get('os')}/{inst.get('arch')}): {st}")
+        if st not in ("running", "ssh-ok"):
+            check("reachable", False, f"vmx up {name}")
+            continue
+        role = inst.get("role", "")
+        if inst.get("os") == "linux":
+            for tool, hint in (("i686-w64-mingw32-g++-posix", "apt install g++-mingw-w64"),
+                               ("astyle", "apt install astyle"),
+                               ("cmake", "see .github/actions/reinstall_cmake"),
+                               ("zip", "apt install zip")):
+                have = guest_run(cfg, run, name, f"command -v {tool} >/dev/null") == 0
+                check(f"{tool}", have, hint)
+        if inst.get("os") == "windows" or role == "packager":
+            # Via the pushed .ps1: inline `powershell -Command` over ssh loses its
+            # quoting, echoes the script back and exits 0 - a false OK.
+            state = win_packager(cfg, run, name, inst, "check")
+            for key, hint in (("candle", "vmx provision (WiX v3.14)"),
+                              ("light", "vmx provision (WiX v3.14)"),
+                              ("cv2pdb", "vmx provision (cv2pdb 0.52)"),
+                              ("mspdb32", "VS Build Tools VC.Tools.x86.x64 - "
+                                          "debug symbols only"),
+                              ("dotnet4", "install .NET Framework 4.8")):
+                check(key, state.get(key, "MISS").startswith("OK"), hint)
+    return 0 if ok else 7
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("verb", nargs="?", default="list")
+    ap.add_argument("targets", nargs="*")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--timeout", type=int, default=None)
+    ap.add_argument("--record")
+    ap.add_argument("--step")
+    ap.add_argument("--issue")
+    ap.add_argument("--from", dest="from_", action="append", default=[])
+    ap.add_argument("--ctest-filter")
+    ap.add_argument("--builder")
+    ap.add_argument("--packager")
+    ap.add_argument("--revision")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--stage1-only", action="store_true")
+    ap.add_argument("--stage2-only", action="store_true")
+    ap.add_argument("--symbols", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    return ap
+
+
+VERBS = {
+    "list": v_list, "doctor": v_doctor, "up": v_up, "sync": v_sync, "deps": v_deps,
+    "exec": v_exec, "build": v_build, "test": v_test, "winagent": v_winagent,
+    "provision": v_provision, "install": v_install,
+    "fetch": v_fetch, "collect": v_collect,
+}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    cmd: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    args = build_parser().parse_args(argv)
+    args.cmd = cmd
+    args.vars = [t for t in args.targets if "=" in t]
+    args.targets = [t for t in args.targets if "=" not in t]
+
+    if args.help or args.verb in ("help", "-h", "--help"):
+        print(__doc__)
+        return 0
+    fn = VERBS.get(args.verb)
+    if not fn:
+        die(2, f"unknown verb {args.verb!r} (see: vmx help)")
+    # winagent takes --builder/--packager rather than a positional instance.
+    if args.verb not in ("list", "doctor", "winagent") and not args.targets:
+        die(2, f"{args.verb} needs an instance (see: vmx list)")
+
+    root = repo_root()
+    cfg = Cfg(root)
+    cfg.want_symbols = args.symbols
+    return fn(cfg, Runner(args), args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

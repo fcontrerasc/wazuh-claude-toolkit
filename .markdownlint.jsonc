@@ -1,0 +1,22 @@
+{
+  // Shared by the md-lint hook and nvim (lua/kickstart/plugins/lint.lua), so the
+  // editor and the agent never disagree about what a clean doc looks like.
+  "default": true,
+
+  // Long tables and pasted terminal output are the point of these docs.
+  "MD013": false,
+  // Duplicate headings are normal: per-arch evidence repeats section names.
+  "MD024": false,
+  // <details>/<summary> is how a single GitHub comment stays readable.
+  "MD033": false,
+  // Bare URLs appear inside pasted transcripts.
+  "MD034": false,
+  // Multiple top-level headings: "# Host - aarch64" / "# Host - x86_64".
+  "MD025": false,
+  // Trailing punctuation in headings such as "Prerequisites 🟢".
+  "MD026": false,
+  // First line need not be a heading; drafts open with a status line.
+  "MD041": false,
+  // Compact table delimiters (|---|---|) render fine on GitHub.
+  "MD060": false
+}

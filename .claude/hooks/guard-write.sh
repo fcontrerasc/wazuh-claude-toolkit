@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# guard-write.sh - PreToolUse guard for Bash.
+#
+# Three classes:
+#   deny  - things only the user does (commits) or that edit text they do not own
+#           (issue/PR bodies belong to QA and reviewers)
+#   ask   - outward-facing publishes and destructive local operations
+#   allow - everything else
+#
+# `gh api` is matched explicitly: an allowlisted `Bash(gh api *)` otherwise
+# routes straight around every gh matcher below.
+
+set -u
+
+INPUT="$(cat)"
+CMD="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""')"
+
+deny() {
+    jq -n --arg r "$1" '{
+        hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: $r
+        }
+    }'
+    exit 0
+}
+
+ask() {
+    jq -n --arg r "$1" '{
+        hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "ask",
+            permissionDecisionReason: $r
+        }
+    }'
+    exit 0
+}
+
+# --- deny: the user commits, always ---------------------------------------
+case "$CMD" in
+    *"git commit"*|*"git push"*)
+        deny "You commit and push, not Claude. Stage/describe the change instead." ;;
+esac
+
+# `git tag` both reads and writes; only the writing forms are the user's call.
+if printf '%s' "$CMD" | grep -q 'git tag'; then
+    if ! printf '%s' "$CMD" | grep -qE 'git tag +(-l\b|--list|-n|--contains|--points-at|--sort|--merged|--no-merged|$)'; then
+        deny "Creating or deleting tags is yours to do. Listing tags (git tag --list) is fine."
+    fi
+fi
+
+# --- deny: never edit issue/PR text or state -----------------------------
+case "$CMD" in
+    *"gh issue edit"*|*"gh pr edit"*|*"gh issue close"*|*"gh issue reopen"*)
+        deny "Issue/PR bodies and state are owned by QA and reviewers. Add a new comment instead." ;;
+esac
+if printf '%s' "$CMD" | grep -qE 'gh api .*-X *(PATCH|PUT|DELETE)'; then
+    deny "gh api write method would edit content you may not own. Add a comment instead."
+fi
+
+# --- ask: outward-facing publish -----------------------------------------
+case "$CMD" in
+    *"gh issue comment"*|*"gh pr comment"*|*"gh pr review"*|*"gh pr create"*)
+        ask "Posts to GitHub (visible to the team). Confirm the exact text." ;;
+esac
+if printf '%s' "$CMD" | grep -qE 'gh api .*-X *POST'; then
+    ask "gh api POST publishes to GitHub. Confirm."
+fi
+
+# --- ask: destructive local ----------------------------------------------
+case "$CMD" in
+    *"rm -rf"*|*"rm -fr"*|*"git reset --hard"*|*"git clean"*|\
+    *"limactl delete"*|*"tart delete"*|*"limactl factory-reset"*)
+        ask "Destructive: $CMD
+Confirm the paths/instances above are the intended targets." ;;
+esac
+
+exit 0

@@ -1,0 +1,110 @@
+# vmx instance registry.
+#
+# Naming: <component>-<os>-<arm|amd>. No 32-bit target is supported, so the "64"
+# is noise in a name; the `arch` field below keeps arm64/amd64 because that is
+# what tooling compares against (vmx maps them to aarch64/x86_64 per backend).
+#
+# The instance name is also the guest hostname, so evidence transcripts read
+# `root@aio-ubuntu-arm:~#` and stay comparable across releases.
+#
+# Unsupported by design (vmx exits 3, never falls back):
+#   macOS amd64, Windows amd64.
+
+# Host budget: 8 CPU / 16GB RAM / ~14GiB free disk. Sizes below are deliberately
+# modest - no VM takes more than half the cores, and lima disks are sparse so the
+# figure is a cap, not an allocation. With this little free space, run ONE build VM
+# at a time; `vmx doctor` warns when free space drops under 20GiB.
+[defaults]
+guest_root = "~/wz"
+# Third-party installers pushed to guests (WiX, cv2pdb...). Deliberately outside
+# the repo: binaries do not belong in a git repo, private or not.
+assets_dir = "~/.local/share/vmx/assets"
+
+# --- build / dev -----------------------------------------------------------
+
+# Default Linux builder AND default winagent stage-1 builder: the arm64 MinGW
+# cross-build is confirmed working, so packaging needs no amd64 detour.
+[instances.builder-ubuntu-arm]
+backend  = "lima"
+instance = "builder-ubuntu-arm"
+component = "builder"
+os       = "linux"
+arch     = "arm64"
+distro   = "ubuntu24"
+user     = "wazuh"
+template = "template://ubuntu-24.04"
+cpus     = 4
+memory   = 4
+disk     = 40
+
+# Real x86 kernel, qemu-emulated. Needed for eBPF / whodata / syscall work and
+# for the CI-pinned clang-format binary (a Linux x86-64 ELF). Created lazily:
+# nothing routine touches it.
+[instances.kernel-ubuntu-amd]
+backend  = "lima"
+instance = "kernel-ubuntu-amd"
+component = "kernel"
+os       = "linux"
+arch     = "amd64"
+distro   = "ubuntu24"
+user     = "wazuh"
+template = "template://ubuntu-24.04"
+cpus     = 4
+memory   = 4
+disk     = 40
+
+[instances.dev-macos-arm]
+backend  = "tart"
+instance = "wazuh-agent"
+component = "dev"
+os       = "macos"
+arch     = "arm64"
+user     = "admin"   # cirruslabs base image default; fine as-is
+image    = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+identity_file = "~/.ssh/wazuh-vmx"
+# bridge: omitted so vmx binds the interface holding the default route (en1 here)
+
+# Externally managed: vmx never creates, starts or stops this one.
+# Packaging + install target only - no compiler, no source tree, scp not rsync.
+[instances.agent-win11-arm]
+backend  = "ssh"
+component = "agent"
+role     = "packager"
+os       = "windows"
+arch     = "arm64"
+user     = "wazuh"
+host     = "192.168.18.234"
+port     = 22
+create   = false
+guest_root = "C:/wz"
+identity_file = "~/.ssh/wazuh-vmx"
+
+# --- E2E topology ----------------------------------------------------------
+# Add one entry per component the test guide requires, then:
+#   vmx up aio-ubuntu-arm agent-debian-arm
+
+[instances.aio-ubuntu-arm]
+backend  = "lima"
+instance = "aio-ubuntu-arm"
+component = "aio"
+os       = "linux"
+arch     = "arm64"
+distro   = "ubuntu24"
+user     = "wazuh"
+template = "template://ubuntu-24.04"
+cpus     = 4
+memory   = 6
+disk     = 30
+
+[instances.agent-debian-arm]
+backend  = "lima"
+instance = "agent-debian-arm"
+component = "agent"
+os       = "linux"
+arch     = "arm64"
+distro   = "debian12"
+user     = "wazuh"
+template = "template://debian-12"
+cpus     = 2
+memory   = 2
+disk     = 20
