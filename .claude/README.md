@@ -78,6 +78,9 @@ bin/vmx exec <instance> [--record F] [--step N] -- CMD
 bin/vmx build <instance> [TARGET=… DEBUG=1 TEST=1] [--json]
 bin/vmx test  <instance> [--ctest-filter RE] [--json]
 bin/vmx winagent --issue N [--debug] [--builder I] [--packager I]
+bin/vmx install <instance> <pkg> [KEY=VALUE...] [--manager I]
+bin/vmx install <instance> --from-source [--manager I]
+bin/vmx enroll  <instance> --manager I
 bin/vmx fetch <instance> PATH... --issue N
 bin/vmx collect <instance> --issue N --from PATH...
 ```
@@ -143,6 +146,43 @@ exists because the CodeBuild images ship no cmake at all, not because 3.28 is to
 old — so building cmake from source here would cost minutes for nothing. It falls
 back to the repo's own `tools/devContainer/reinstall-cmake.sh` only if apt is older
 than the minimum.
+
+### Deploying and enrolling agents
+
+```bash
+bin/vmx install agent-win11-arm <msi> --manager aio-ubuntu-arm     # package
+bin/vmx install agent-ubuntu22-arm --from-source --manager aio-ubuntu-arm
+bin/vmx enroll  agent-ubuntu22-arm --manager aio-ubuntu-arm        # re-enroll only
+```
+
+`--manager` reads that instance's bridged address and its generated
+`/var/wazuh-manager/etc/authd.pass`, so no password is copied by hand. It has to be
+applied differently per platform:
+
+| Platform | Address | Password |
+|---|---|---|
+| Windows MSI | `WAZUH_MANAGER=` property | `WAZUH_REGISTRATION_PASSWORD=` property |
+| Linux source | `USER_AGENT_MANAGER_IP` in `preloaded-vars.conf` | `authd.pass` written **after** install — `install.sh` has no password variable |
+
+Explicit `KEY=VALUE` arguments always win over `--manager`.
+
+Four things here are not obvious and each one broke a run:
+
+- **The NAT address is useless between guests.** Every lima guest has the same
+  `192.168.5.15` on `eth0`; `guest_ip()` returns the bridged `lima0` address, or an
+  agent would be pointed at itself.
+- **`authd.pass` must be group-readable by the agent.** `wazuh-agentd` runs as user
+  `wazuh`; a `root:root` file makes it log `No authentication password provided`, as
+  if the file were absent. The group is taken from `<dir>/etc`, not hardcoded.
+- **Enrollment needs the password at all.** Without it the manager answers
+  `Invalid password. Unable to add agent`, which is the wall the 37470 E2E test hit.
+- **`/qn` does not start the service.** The installer's `StartWazuhSvc` action is not
+  deferred (WiX warns `ICE68`), so the service registers but reports `STOPPED` with
+  1077; `install` runs `sc start WazuhSvc` itself.
+
+Install paths differ by role: an **agent** lands in `/var/ossec`, a **manager** in
+`/var/wazuh-manager` (`install.sh:1122`). Checking the wrong one produces a
+confident false negative.
 
 ### Sync, not mount
 
@@ -458,7 +498,10 @@ Everything below was exercised end to end on this host, not just written.
 | `provision` | cmake 3.28.3 from apt (no source build), `i686-w64-mingw32-g++-posix (GCC) 13-posix` |
 | `deps TARGET=winagent` | 231M of external deps built at `v5.0.0-beta4` |
 | `fix_host_tools` | rebuilt `flatc` as ARM aarch64 after the bundle's x86-64 copy |
-| `winagent` stage 1 | i686 cross-build progressing past `generate_flatbuffers`, `.exe` artifacts produced |
+| `winagent` both stages | i686 cross-build → MSI 6.5MB + debug symbols 8MB, fetched to `docs/<issue>/artifacts/` |
+| AIO stack | beta4 from packages on `aio-ubuntu-arm`, indexer + manager + dashboard active |
+| Windows agent deploy | MSI installed, enrolled as `001`, `(4102): Connected to the server` |
+| Linux source agent | Ubuntu 22.04 built from the tag, enrolled as `002`, connected |
 | Windows guest | passwordless `exec` via `identity_file`, `cmd /c ver` → `10.0.26100.1742` |
 | All 6 hooks | every deny/ask decision checked per matcher |
 
