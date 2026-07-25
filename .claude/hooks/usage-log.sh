@@ -7,13 +7,11 @@
 
 set -u
 
-LOG="${CLAUDE_USAGE_LOG:-$HOME/.claude/usage/wazuh-tooling.jsonl}"
-mkdir -p "$(dirname "$LOG")" 2>/dev/null || exit 0
+. "$(dirname "$0")/lib-usage.sh"
 
 INPUT="$(cat)"
 EVENT="$(printf '%s' "$INPUT" | jq -r '.hook_event_name // ""')"
 SESSION="$(printf '%s' "$INPUT" | jq -r '.session_id // ""')"
-TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 kind=""; name=""
 case "$EVENT" in
@@ -46,7 +44,5 @@ esac
 
 [ -n "$kind" ] || exit 0
 
-jq -n -c --arg ts "$TS" --arg kind "$kind" --arg name "$name" --arg session "$SESSION" \
-    '{ts:$ts, kind:$kind, name:$name, session:$session}' >> "$LOG" 2>/dev/null
-
+log_use "$kind" "$name" invoked
 exit 0

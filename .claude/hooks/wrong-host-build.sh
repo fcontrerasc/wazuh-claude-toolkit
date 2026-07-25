@@ -7,6 +7,8 @@
 
 set -u
 
+. "$(dirname "$0")/lib-usage.sh"
+
 INPUT="$(cat)"
 CMD="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""')"
 CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // ""')"
@@ -23,6 +25,7 @@ esac
 
 case "$CMD" in
     make\ *|*"make -C src"*|cmake\ *|*" cmake "*|g++\ *|gcc\ *|*astyle*)
+        log_use hook wrong-host-build ask
         jq -n --arg r "Build/style command on the macOS host. The toolchain lives in a VM:
   bin/vmx build builder-ubuntu-arm TARGET=agent
   bin/vmx winagent --issue N

@@ -6,6 +6,8 @@
 
 set -u
 
+. "$(dirname "$0")/lib-usage.sh"
+
 INPUT="$(cat)"
 MSG="$(printf '%s' "$INPUT" | jq -r '.message // ""')"
 
@@ -14,6 +16,7 @@ case "$MSG" in
     *) exit 0 ;;
 esac
 
+log_use hook build-notify notified
 TITLE="wazuh build"
 # vmx --json prints {"instance": "...", "os": "...", "arch": "...", "exit": N}
 DETAIL="$(printf '%s' "$MSG" | tr -d '\n' | cut -c1-180)"

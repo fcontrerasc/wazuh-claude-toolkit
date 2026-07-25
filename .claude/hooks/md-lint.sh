@@ -12,6 +12,8 @@
 
 set -u
 
+. "$(dirname "$0")/lib-usage.sh"
+
 INPUT="$(cat)"
 FILE="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""')"
 [ -n "$FILE" ] || exit 0
@@ -60,7 +62,9 @@ cleanup/teardown sections are not used in these docs:
 $CLEAN"
 
 if [ -n "$(printf '%s' "$PROBLEMS" | tr -d '[:space:]')" ]; then
+    log_use hook md-lint finding
     printf 'md-lint %s:\n%s\n' "$FILE" "$PROBLEMS" >&2
     exit 2
 fi
+log_use hook md-lint clean
 exit 0

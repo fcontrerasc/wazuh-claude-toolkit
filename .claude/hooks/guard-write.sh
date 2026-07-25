@@ -12,10 +12,13 @@
 
 set -u
 
+. "$(dirname "$0")/lib-usage.sh"
+
 INPUT="$(cat)"
 CMD="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""')"
 
 deny() {
+    log_use hook guard-write deny
     jq -n --arg r "$1" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -23,10 +26,11 @@ deny() {
             permissionDecisionReason: $r
         }
     }'
-    exit 0
+exit 0
 }
 
 ask() {
+    log_use hook guard-write ask
     jq -n --arg r "$1" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -86,4 +90,5 @@ Confirm the target above; deletions are not recoverable." ;;
     esac
 fi
 
+log_use hook guard-write allow
 exit 0

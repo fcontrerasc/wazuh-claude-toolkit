@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""usage-report - what of this toolkit actually gets used.
+
+Pure accounting: reads the log hooks append to and prints a table. No model is
+involved, so checking costs nothing but a process. Run it directly:
+
+    bin/usage-report            counts, last use, prune candidates
+    bin/usage-report --json     machine-readable
+    bin/usage-report --days 30  window for the prune rule (default 30)
+
+Log format is TSV (ts, kind, name, detail) because a hook that fires on every tool
+call must cost a printf, not a jq. Legacy JSONL lines are still parsed.
+
+Decision rule, applied to the window:
+    0 uses      -> delete it
+    1-2 uses    -> fold into a neighbour
+    steady      -> keep
+"""
+
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+LOG = Path(os.environ.get(
+    "CLAUDE_USAGE_LOG", str(Path.home() / ".claude/usage/wazuh-tooling.jsonl")))
+TOOLKIT = Path(__file__).resolve().parent.parent
+
+
+def parse(line: str):
+    """(timestamp, kind, name, detail) or None."""
+    line = line.rstrip("\n")
+    if not line:
+        return None
+    if line.startswith("{"):                      # legacy JSONL
+        try:
+            d = json.loads(line)
+            return d["ts"], d.get("kind", "?"), d.get("name", "?"), d.get("detail", "")
+        except (ValueError, KeyError):
+            return None
+    parts = line.split("\t")
+    if len(parts) < 3:
+        return None
+    return parts[0], parts[1], parts[2], (parts[3] if len(parts) > 3 else "")
+
+
+def on_disk() -> dict[str, set[str]]:
+    """Everything installed, so items that never fired can be named."""
+    return {
+        "command": {p.stem for p in (TOOLKIT / ".claude/commands").glob("*.md")},
+        "skill": {p.parent.name for p in (TOOLKIT / ".claude/skills").glob("*/SKILL.md")},
+        "agent": {p.stem for p in (TOOLKIT / ".claude/agents").glob("*.md")},
+        "hook": {p.stem for p in (TOOLKIT / ".claude/hooks").glob("*.sh")
+                 if not p.stem.startswith("lib-")},
+    }
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    days = 30
+    if "--days" in args:
+        days = int(args[args.index("--days") + 1])
+
+    if not LOG.exists():
+        print(f"no usage log yet at {LOG}")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    total, window, last, details = (defaultdict(int), defaultdict(int), {},
+                                    defaultdict(lambda: defaultdict(int)))
+
+    for line in LOG.read_text(errors="replace").splitlines():
+        rec = parse(line)
+        if not rec:
+            continue
+        ts_s, kind, name, detail = rec
+        # Legacy noise: an older logger treated any pasted absolute path as a
+        # slash command. Real command names never contain a slash.
+        if kind == "command" and "/" in name.lstrip("/"):
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        key = (kind, name)
+        total[key] += 1
+        if ts >= cutoff:
+            window[key] += 1
+        if key not in last or ts > last[key]:
+            last[key] = ts
+        if detail:
+            details[key][detail] += 1
+
+    installed = on_disk()
+    for kind, names in installed.items():
+        for name in names:
+            key = (kind, name)
+            total.setdefault(key, 0)
+            window.setdefault(key, 0)
+
+    def verdict(key) -> str:
+        n = window[key]
+        if n == 0:
+            return "DELETE" if key[0] != "hook" else "unused"
+        if n <= 2:
+            return "fold?"
+        return "keep"
+
+    if as_json:
+        print(json.dumps([
+            {"kind": k, "name": n, "total": total[(k, n)], f"last_{days}d": window[(k, n)],
+             "last_used": last.get((k, n)).isoformat() if (k, n) in last else None,
+             "details": dict(details[(k, n)]), "verdict": verdict((k, n))}
+            for (k, n) in sorted(total, key=lambda x: (-window[x], x))
+        ], indent=2))
+        return 0
+
+    width = max([len(f"{k}:{n}") for k, n in total] + [20])
+    print(f"{'ITEM':<{width}}  {'TOTAL':>5} {f'{days}D':>5}  LAST      VERDICT  DETAIL")
+    for key in sorted(total, key=lambda x: (x[0], -window[x], x[1])):
+        kind, name = key
+        ago = f"{(now - last[key]).days}d ago" if key in last else "never"
+        det = " ".join(f"{k}={v}" for k, v in sorted(details[key].items()))
+        print(f"{kind + ':' + name:<{width}}  {total[key]:>5} {window[key]:>5}  "
+              f"{ago:<9} {verdict(key):<8} {det}")
+
+    dead = [f"{k}:{n}" for (k, n) in total if verdict((k, n)) == "DELETE"]
+    if dead:
+        print(f"\n{len(dead)} never used in {days}d -> delete: {', '.join(sorted(dead))}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

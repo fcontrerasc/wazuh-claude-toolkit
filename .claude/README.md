@@ -97,11 +97,27 @@ also the guest hostname, so evidence transcripts read
 |---|---|---|
 | `builder-ubuntu-arm` | lima `vz`, Ubuntu 24.04 | default Linux builder **and** default winagent stage-1 builder |
 | `kernel-ubuntu-amd` | lima qemu | real x86 kernel: eBPF, whodata, syscalls. Created lazily |
+
 | `agent-macos-arm` | tart | macOS agent, built from source |
+| `agent-ubuntu22-arm` | lima `vz` | Linux arm64 agent, built from source |
+| `agent-ubuntu-amd` | lima qemu | Linux **x86_64** agent, built from source. Emulated, so slow — but it is the only leg that sees `__x86_64__` code, x86 alignment behaviour and CI's architecture |
 | `agent-win11-arm` | ssh only | MSI packaging + install. Never created or stopped by `vmx` |
 | `aio-ubuntu-arm`, `agent-debian-arm` | lima | E2E topology |
 
 macOS amd64 and Windows amd64 exit 3. No fallback, no emulation shortcut.
+
+### Non-native (x86_64) guests
+
+Homebrew's lima bottle ships a guest agent only for the host architecture, so an
+amd64 guest fails at start with
+`guest agent binary could not be found for Linux-x86_64`. One-time fix:
+
+```bash
+brew install lima-additional-guestagents      # must match your lima version
+```
+
+`vmx doctor` checks for it whenever an `amd64` lima instance is registered. qemu
+also has to be present (`brew install qemu`).
 
 ### Host budget
 

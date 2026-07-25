@@ -13,6 +13,8 @@
 
 set -u
 
+. "$(dirname "$0")/lib-usage.sh"
+
 INPUT="$(cat)"
 FILE="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // ""')"
 [ -n "$FILE" ] || exit 0
@@ -30,7 +32,8 @@ OUT="$(WZFMT_QUIET_VERSION=1 "$WZFMT" --check "$FILE" 2>&1)"
 RC=$?
 
 # 0 clean or ungoverned; 2 tool unusable on this host; 3 config missing.
-[ "$RC" -eq 1 ] || exit 0
+if [ "$RC" -ne 1 ]; then log_use hook fmt-on-write clean; exit 0; fi
+log_use hook fmt-on-write finding
 
 DECISION="$(WZFMT_QUIET_VERSION=1 "$WZFMT" --which "$FILE" 2>/dev/null | cut -f1)"
 printf 'Style (%s, advisory - host tool version differs from CI):\n%s\n' \
