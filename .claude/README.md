@@ -95,7 +95,7 @@ also the guest hostname, so evidence transcripts read
 |---|---|---|
 | `builder-ubuntu-arm` | lima `vz`, Ubuntu 24.04 | default Linux builder **and** default winagent stage-1 builder |
 | `kernel-ubuntu-amd` | lima qemu | real x86 kernel: eBPF, whodata, syscalls. Created lazily |
-| `dev-macos-arm` | tart | macOS agent |
+| `agent-macos-arm` | tart | macOS agent, built from source |
 | `agent-win11-arm` | ssh only | MSI packaging + install. Never created or stopped by `vmx` |
 | `aio-ubuntu-arm`, `agent-debian-arm` | lima | E2E topology |
 
@@ -146,6 +146,23 @@ exists because the CodeBuild images ship no cmake at all, not because 3.28 is to
 old — so building cmake from source here would cost minutes for nothing. It falls
 back to the repo's own `tools/devContainer/reinstall-cmake.sh` only if apt is older
 than the minimum.
+
+### macOS guests (tart)
+
+Seven things differ from Linux, and each one broke a run before it was handled:
+
+| Difference | Handling |
+|---|---|
+| `tart ip` is blind to bridged VMs (it reads NAT DHCP leases) | try `--resolver arp` first, then fall back |
+| Guest starts password-only, and macOS ships no `sshpass` | `.claude/setup/tart-ssh-key.sh <ip>` (expect-based); it verifies key auth before reporting success |
+| Homebrew ships **CMake 4.x**, which refuses `cmake_minimum_required < 3.5` — two bundled deps declare 2.8.12 and 3.4 | `provision` pins CI's **3.31.6** from Kitware into `/opt/cmake-3.31.6` and symlinks it into `/usr/local/bin`, ahead of brew |
+| Non-interactive PATH is only `/usr/bin:/bin:/usr/sbin:/sbin`; brew and `/usr/local/bin` are absent | every build step gets an explicit PATH prefix, and `install.sh` receives it as a **literal** string via `sudo env` — sudo drops the caller's PATH |
+| `install.sh` defaults an agent to `/var/ossec` on **every** OS (no Darwin branch) | `USER_DIR=/Library/Ossec` is passed explicitly — the documented macOS location, also used by `packages/macos/*` and `src/init/pkg_installer.sh:30` |
+| The image's own hostname would become the agent name on the manager | `up` sets HostName, LocalHostName and ComputerName from the instance name |
+| BSD userland is not GNU | `stat -f %Sg`, `sed -i ''`, `$(sysctl -n hw.ncpu)` |
+
+Cloning the cirruslabs base image needs ~33GB, so an existing local VM is reused
+where possible; `tart list` shows what is on disk.
 
 ### Deploying and enrolling agents
 
@@ -502,6 +519,7 @@ Everything below was exercised end to end on this host, not just written.
 | AIO stack | beta4 from packages on `aio-ubuntu-arm`, indexer + manager + dashboard active |
 | Windows agent deploy | MSI installed, enrolled as `001`, `(4102): Connected to the server` |
 | Linux source agent | Ubuntu 22.04 built from the tag, enrolled as `002`, connected |
+| macOS source agent | macOS 15.7.7 arm64 built from the tag into `/Library/Ossec`, enrolled as `003`, connected |
 | Windows guest | passwordless `exec` via `identity_file`, `cmd /c ver` → `10.0.26100.1742` |
 | All 6 hooks | every deny/ask decision checked per matcher |
 

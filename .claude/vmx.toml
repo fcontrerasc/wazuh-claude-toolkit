@@ -59,7 +59,8 @@ instance = "agent-macos-arm"
 component = "agent"
 os       = "macos"
 arch     = "arm64"
-user     = "admin"   # cirruslabs base image default; fine as-is
+user     = "admin"      # cirruslabs base image default
+password = "admin"      # image default, used once to install the automation key
 # Reuses the existing local VM; cloning the OCI base image needs ~33GB.
 image    = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
 identity_file = "~/.ssh/wazuh-vmx"

@@ -39,6 +39,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,6 +287,55 @@ def guest_ip(name: str, inst: dict) -> str:
 
 
 MANAGER_PASS_FILE = "/var/wazuh-manager/etc/authd.pass"
+MANAGER_KEYS_FILE = "/var/wazuh-manager/etc/client.keys"
+
+
+def manager_api(cfg: Cfg, run: Runner, mname: str, minst: dict, method: str,
+                path: str) -> tuple[int, str]:
+    """Call the manager API from inside the manager guest.
+
+    Runs there rather than from the host so no port needs exposing and the
+    certificate is the local one. Returns (exit status, body).
+    """
+    user = minst.get("api_user", "wazuh")
+    pw = minst.get("api_password", "wazuh")
+    base = "https://localhost:55000"
+    script = (
+        f"T=$(curl -sk -u {user}:{pw} -X POST "
+        f"'{base}/security/user/authenticate?raw=true'); "
+        '[ -n "$T" ] || { echo "API authentication failed"; exit 1; }; '
+        f'curl -sk -X {method} -H "Authorization: Bearer $T" \'{base}{path}\''
+    )
+    r = run.sh(ssh_cmd(mname, minst) + [script])
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def manager_forget_agent(cfg: Cfg, run: Runner, mgr_target: str, agent: str) -> int:
+    """Delete an agent from the manager by name, through the API.
+
+    authd refuses a known name with "Duplicate agent name", which bites every time a
+    VM is recreated - the instance name never changes. The API is used rather than
+    editing client.keys: authd keeps the key list in memory, so editing the file
+    leaves it still rejecting the name until the manager is restarted.
+    """
+    mname, minst = cfg.resolve(mgr_target)
+    rc, body = manager_api(cfg, run, mname, minst, "GET",
+                           f"/agents?name={agent}&select=id,name")
+    if rc:
+        print(f"{mname}: API query failed: {body.strip()[:200]}")
+        return rc
+    ids = [a["id"] for a in api_items(body) if a.get("name") == agent]
+    if not ids:
+        print(f"no agent named {agent} on {mname}")
+        return 0
+    rc, body = manager_api(
+        cfg, run, mname, minst, "DELETE",
+        f"/agents?agents_list={','.join(ids)}&status=all&older_than=0s")
+    if rc or '"error":0' not in body.replace(" ", ""):
+        print(f"{mname}: delete failed: {body.strip()[:300]}")
+        return rc or 1
+    print(f"{mname}: deleted agent {agent} (id {','.join(ids)})")
+    return 0
 
 
 def manager_secret(cfg: Cfg, run: Runner, mgr_target: str) -> tuple[str, str]:
@@ -463,15 +513,62 @@ def v_up(cfg: Cfg, run: Runner, args) -> int:
                 else:
                     subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
+            if not run.dry:
+                tart_ready(cfg, run, name, inst)
             # The image ships its own hostname, which would become the agent name
             # registered on the manager. Idempotent, so it runs on every up.
-            if not run.dry and already:
+            if not run.dry:
                 run.sh(ssh_cmd(name, inst) + [
                     f"sudo scutil --set HostName {shlex.quote(name)}; "
                     f"sudo scutil --set LocalHostName {shlex.quote(name)}; "
                     f"sudo scutil --set ComputerName {shlex.quote(name)}"])
         print(f"{name}: up")
     return 0
+
+
+def tart_ready(cfg: Cfg, run: Runner, name: str, inst: dict, timeout: int = 300):
+    """Wait for a tart guest to boot, then make key auth work.
+
+    A fresh cirruslabs image accepts passwords only, so every later verb would fail
+    on authentication. The key is installed once here, which is what makes
+    `up -> provision -> install` unattended.
+    """
+    key = os.path.expanduser(inst.get("identity_file", "~/.ssh/wazuh-vmx"))
+    user = inst.get("user", "admin")
+    deadline = time.monotonic() + timeout
+    ip = ""
+    while time.monotonic() < deadline:
+        r = subprocess.run(["tart", "ip", inst.get("instance", name),
+                            "--resolver", "arp"], capture_output=True, text=True)
+        cand = r.stdout.strip()
+        if cand and not cand.startswith("no "):
+            ip = cand
+            break
+        time.sleep(5)
+    if not ip:
+        die(4, f"{name}: no IP after {timeout}s (still booting?)")
+
+    def key_ok() -> bool:
+        return subprocess.run(
+            ["ssh", "-i", key, "-o", "IdentitiesOnly=yes", "-o",
+             "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout=8", f"{user}@{ip}", "true"],
+            capture_output=True).returncode == 0
+
+    while time.monotonic() < deadline:
+        if key_ok():
+            return
+        # sshd may simply not be up yet; only try the installer once it answers.
+        if subprocess.run(["nc", "-z", "-G", "3", ip, "22"],
+                          capture_output=True).returncode == 0:
+            script = main_repo(repo_root()) / ".claude/setup/tart-ssh-key.sh"
+            print(f"{name}: installing the automation key on {ip}")
+            run.sh([str(script), ip, user, inst.get("password", "admin"),
+                    key + ".pub"], capture=False)
+            if key_ok():
+                return
+        time.sleep(5)
+    die(4, f"{name}: key authentication never succeeded for {user}@{ip}")
 
 
 def create(run: Runner, name: str, inst: dict):
@@ -998,6 +1095,8 @@ def v_install(cfg: Cfg, run: Runner, args) -> int:
 
     mgr_ip = mgr_pw = ""
     if args.manager:
+        if args.force and manager_forget_agent(cfg, run, args.manager, name):
+            die(1, f"{args.manager}: could not drop the stale entry for {name}")
         mgr_ip, mgr_pw = manager_secret(cfg, run, args.manager)
         print(f"manager {args.manager}: {mgr_ip}"
               + (f", registration password ({len(mgr_pw)} chars)" if mgr_pw else ""))
@@ -1143,6 +1242,8 @@ def v_enroll(cfg: Cfg, run: Runner, args) -> int:
     name, inst = cfg.resolve(args.targets[0])
     if not args.manager:
         die(2, f"enroll needs --manager <instance>")
+    if args.force and manager_forget_agent(cfg, run, args.manager, name):
+        die(1, f"{args.manager}: could not drop the stale entry for {name}")
     mgr_ip, mgr_pw = manager_secret(cfg, run, args.manager)
     if inst.get("os") not in ("linux", "macos"):
         die(3, f"{name}: enroll covers Linux and macOS agents; on Windows reinstall "
@@ -1161,6 +1262,59 @@ def v_enroll(cfg: Cfg, run: Runner, args) -> int:
               f"sleep 8; sudo grep -E 'Valid key|Connected to the server' "
               f"{adir}/logs/ossec.log | tail -3", capture=True)
     return 0
+
+
+def api_items(body: str) -> list[dict]:
+    """affected_items from an API response. JSON, not regex: pairing fields with
+    regex silently mismatched ids to names."""
+    try:
+        start = body.index("{")
+        return json.loads(body[start:])["data"]["affected_items"]
+    except (ValueError, KeyError):
+        return []
+
+
+def v_agents(cfg: Cfg, run: Runner, args) -> int:
+    """List agents known to a manager: vmx agents <manager>"""
+    mname, minst = cfg.resolve(args.targets[0])
+    rc, body = manager_api(cfg, run, mname, minst, "GET",
+                           "/agents?select=id,name,status,version&limit=500")
+    if rc:
+        die(1, f"{mname}: API query failed: {body.strip()[:200]}")
+    if args.json:
+        print(body)
+        return 0
+    items = api_items(body)
+    for a in items:
+        print(f"{a.get('id', ''):>4}  {a.get('name', ''):<28} "
+              f"{a.get('status', ''):<14} {a.get('version', '')}")
+    print(f"{len(items)} agent(s) on {mname}")
+    return 0
+
+
+def v_agent_rm(cfg: Cfg, run: Runner, args) -> int:
+    """Delete agents from a manager: vmx agent-rm <manager> <id|name>...
+
+    Exists because remembering the two-step API dance (authenticate, then DELETE
+    with status and older_than) is not worth doing by hand, and a stale agent blocks
+    a rebuilt VM from enrolling under the same name.
+    """
+    if len(args.targets) < 2:
+        die(2, "usage: vmx agent-rm <manager> <agent-id|agent-name>...")
+    mname, minst = cfg.resolve(args.targets[0])
+    failed = 0
+    for target in args.targets[1:]:
+        if target.isdigit():
+            rc, body = manager_api(
+                cfg, run, mname, minst, "DELETE",
+                f"/agents?agents_list={target}&status=all&older_than=0s")
+            ok = not rc and '"error":0' in body.replace(" ", "")
+            print(f"{mname}: {'deleted' if ok else 'failed to delete'} agent {target}"
+                  + ("" if ok else f": {body.strip()[:200]}"))
+            failed += 0 if ok else 1
+        else:
+            failed += 1 if manager_forget_agent(cfg, run, mname, target) else 0
+    return 1 if failed else 0
 
 
 def v_fetch(cfg: Cfg, run: Runner, args) -> int:
@@ -1288,6 +1442,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--stage")
     ap.add_argument("--manager")
     ap.add_argument("--from-source", action="store_true")
+    ap.add_argument("--force", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     return ap
 
@@ -1296,6 +1451,7 @@ VERBS = {
     "list": v_list, "doctor": v_doctor, "up": v_up, "sync": v_sync, "deps": v_deps,
     "exec": v_exec, "build": v_build, "test": v_test, "winagent": v_winagent,
     "provision": v_provision, "install": v_install, "enroll": v_enroll,
+    "agents": v_agents, "agent-rm": v_agent_rm,
     "fetch": v_fetch, "collect": v_collect,
 }
 
