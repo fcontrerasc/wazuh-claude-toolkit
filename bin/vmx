@@ -22,7 +22,7 @@ Verbs:
   winagent [--builder INSTANCE] [--packager INSTANCE] --issue N
   fetch    INSTANCE GUEST_PATH... --issue N
   collect  INSTANCE --issue N --from PATH...
-  install  INSTANCE MSI_OR_PKG
+  install  INSTANCE PKG [KEY=VALUE...]  MSI properties, e.g. WAZUH_MANAGER=1.2.3.4
 
 Global: --json --dry-run --quiet --timeout S --record [--step NAME]
 
@@ -573,6 +573,10 @@ def v_provision(cfg: Cfg, run: Runner, args) -> int:
     name, inst = cfg.resolve(args.targets[0])
     if inst.get("os") == "windows":
         return provision_windows(cfg, run, name, inst)
+    # The full stack is only ever installed from packages: indexer and dashboard are
+    # not built from source here (agent and manager are the buildable pieces).
+    if inst.get("component") in ("aio", "manager", "indexer", "dashboard"):
+        return provision_stack(cfg, run, name, inst, getattr(cfg, "stage", None))
     if inst.get("os") != "linux":
         die(3, f"{name}: provision covers Linux and Windows guests")
     pkgs = " ".join(PROVISION_APT)
@@ -639,6 +643,48 @@ def win_packager(cfg: Cfg, run: Runner, name: str, inst: dict,
             k, _, v = line.strip().partition("=")
             found[k] = v
     return found
+
+
+STAGING_ASSISTANT = ("https://packages-staging.xdrsiem.wazuh.info/pre-release/5.x"
+                     "/installation-assistant")
+
+
+def provision_stack(cfg: Cfg, run: Runner, name: str, inst: dict,
+                    stage: str | None) -> int:
+    """Install the Wazuh stack from packages via the installation assistant.
+
+    Never from source: only the agent and the manager are built here, so an AIO,
+    indexer or dashboard always comes from packages. The stack version must be >=
+    the agent's, or the agent will not work against it.
+    """
+    stage = stage or inst.get("stage")
+    if not stage:
+        die(2, f"{name}: needs a stage, e.g. vmx provision {name} --stage beta4")
+    script = f"wazuh-install-5.0.0-{stage}.sh"
+
+    already = guest_run(cfg, run, name,
+                        "test -f /etc/wazuh-indexer/opensearch.yml && echo installed")
+    if already == 0:
+        print(f"{name}: stack already installed (assistant is not re-runnable; "
+              "recreate the VM for a clean install)")
+        return 0
+
+    # -a all-in-one, -d pre-release (documented), -id so the assistant installs its
+    # own prerequisites instead of stopping (a bare Ubuntu 24.04 lacks
+    # apt-transport-https and debhelper).
+    # pipefail matters: without it `... | tail` returns tail's status and a failed
+    # install reports success.
+    # Run from $HOME, not the synced tree: the assistant downloads its .deb files
+    # into the cwd, and those have no business inside a source checkout.
+    cmd = ('cd "$HOME" && set -o pipefail; '
+           f"curl -sO {STAGING_ASSISTANT}/{script} && "
+           f"sudo bash ./{script} -a -d pre-release -id 2>&1 | tail -40")
+    rc = guest_run(cfg, run, name, cmd, capture=True)
+    if rc:
+        die(1, f"{name}: installation assistant failed - full log in "
+               "/var/log/wazuh-install.log on the guest")
+    print(f"{name}: stack {stage} installed")
+    return 0
 
 
 def provision_windows(cfg: Cfg, run: Runner, name: str, inst: dict) -> int:
@@ -859,12 +905,21 @@ def v_install(cfg: Cfg, run: Runner, args) -> int:
     remote = f"C:/Users/{inst['user']}/{pkg.name}"
     if push(run, name, inst, pkg, remote):
         die(1, f"{name}: could not upload {pkg.name}")
+    # KEY=VALUE arguments become MSI properties, which is how the Wazuh agent is
+    # pointed at a manager at install time (WAZUH_MANAGER, WAZUH_AGENT_GROUP,
+    # WAZUH_REGISTRATION_PASSWORD...).
+    props = " ".join(args.vars)
     # /qn keeps it non-interactive; msiexec returns 3010 when a reboot is pending.
     rc = guest_run(cfg, run, name,
-                   f'msiexec /i "{remote.replace("/", chr(92))}" /qn /l*v '
+                   f'msiexec /i "{remote.replace("/", chr(92))}" /qn {props} /l*v '
                    'C:\\Users\\%USERNAME%\\msi-install.log', capture=True)
     if rc not in (0, 3010):
         die(1, f"{name}: msiexec failed ({rc}); log at C:/Users/{inst['user']}/msi-install.log")
+
+    # The installer's StartWazuhSvc custom action is not deferred (WiX warns ICE68),
+    # so under /qn the service is registered but never started - it reports STOPPED
+    # with 1077, "no start attempted since boot". Start it here.
+    guest_run(cfg, run, name, "sc start WazuhSvc", capture=True)
     guest_run(cfg, run, name, "sc query WazuhSvc", capture=True)
     return 0
 
@@ -991,6 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--stage1-only", action="store_true")
     ap.add_argument("--stage2-only", action="store_true")
     ap.add_argument("--symbols", action="store_true")
+    ap.add_argument("--stage")
     ap.add_argument("-h", "--help", action="store_true")
     return ap
 
@@ -1027,6 +1083,7 @@ def main() -> int:
     root = repo_root()
     cfg = Cfg(root)
     cfg.want_symbols = args.symbols
+    cfg.stage = args.stage
     return fn(cfg, Runner(args), args)
 
 

@@ -70,10 +70,20 @@ fi
 
 # --- ask: destructive local ----------------------------------------------
 case "$CMD" in
-    *"rm -rf"*|*"rm -fr"*|*"git reset --hard"*|*"git clean"*|\
+    *"git reset --hard"*|*"git clean"*|\
     *"limactl delete"*|*"tart delete"*|*"limactl factory-reset"*)
         ask "Destructive: $CMD
 Confirm the paths/instances above are the intended targets." ;;
 esac
+
+# Any rm, not only rm -rf: deleting one file is just as irreversible. Scratchpad
+# paths are exempt - that directory exists to be thrown away.
+if printf '%s' "$CMD" | grep -qE '(^|[;&|[:space:]])rm([[:space:]]|$)'; then
+    case "$CMD" in
+        *"/scratchpad/"*|*"/private/tmp/claude-"*|*"/tmp/"*) ;;
+        *) ask "Deletion: $CMD
+Confirm the target above; deletions are not recoverable." ;;
+    esac
+fi
 
 exit 0
