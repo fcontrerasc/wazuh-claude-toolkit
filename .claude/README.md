@@ -465,6 +465,14 @@ corrected root cause **was** the deliverable.
 
 ### C. E2E test — environment plus comment skeleton
 
+**TODO: not yet validated end to end.** A and B have been exercised on this host;
+this one has not run against a live E2E issue, so treat the steps below as the
+intended design rather than as verified behaviour. What is still unproven: parsing
+a real guide into sections and steps, the topology coming up from
+`docs/<issue>/topology.txt`, and the assembled comment landing under GitHub's size
+limit. First real E2E subtask settles all three, and decides whether
+`bin/e2e-skeleton` is worth writing.
+
 For a release E2E subtask (e.g. 37470). Two hard boundaries.
 
 **Never run a guide step.** Its output is the evidence; pre-running it destroys
@@ -636,7 +644,8 @@ nor rsync quoting (a 660M sync landed in a directory literally named `$HOME`).
 | Not done | Why |
 |---|---|
 | `kernel-ubuntu-amd` | created lazily, on the first eBPF/whodata task. The only place CI's clang-format can run (it ships as a Linux x86-64 ELF) |
-| `bin/e2e-skeleton` | one cached guide is not enough to fix the parse shape; the next real E2E issue decides it |
+| **Workflow C (E2E) validation** | never run against a live E2E issue. Unproven: guide parsing, topology bring-up from `topology.txt`, assembled comment under the 65,536-char limit |
+| `bin/e2e-skeleton` | one cached guide is not enough to fix the parse shape; the same first real E2E issue decides it |
 | 11 commands, 3 skills, 3 agents unexercised | they exist but no real issue has run through them yet. `bin/usage-report` decides at 30 days, from the log rather than from taste |
 
 `agent-macos-arm` uses the tart base image's `admin` account rather than `wazuh`
