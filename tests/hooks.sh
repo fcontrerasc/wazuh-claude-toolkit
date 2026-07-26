@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# tests/hooks.sh - the checks that fail if hook classification breaks.
+# tests/hooks.sh - the checks that fail if the toolkit's decision logic breaks.
 #
 # Covers: usage-log naming (a name keyed with a slash never matches the file on
 # disk), command-vs-skill routing, guard-write's deny/ask/allow classes, the rm
-# temp-path anchoring, and usage-report's argument guard.
+# temp-path anchoring, mdcheck's three rules, md-lint's scope, that fmt-on-write
+# never pastes a diff, wzissue's label map and slug truncation, and
+# usage-report's argument guard.
 #
 # CLAUDE_USAGE_LOG points at a temp file: a test must not truncate the real log.
 set -u
@@ -121,6 +123,10 @@ FMT="$(jq -n --arg f "$SANDBOX/x.cpp" '{tool_input:{file_path:$f}}' \
 ck "fmt-on-write does not paste the diff" "2" "$(printf '%s\n' "$FMT" | grep -c .)"
 ck "fmt-on-write reports the count" "1" "$(printf '%s' "$FMT" | grep -c '500 finding')"
 ck "fmt-on-write names the fix" "1" "$(printf '%s' "$FMT" | grep -c 'wzfmt --write')"
+
+# --- wzissue: label map, slug and branch truncation ------------------------
+"$TOOLKIT/bin/wzissue" --self-test >/dev/null 2>&1
+ck "wzissue self-test passes" "0" "$?"
 
 # --- usage-report: argument guard, and hooks reported as wired -------------
 R="$TOOLKIT/bin/usage-report"

@@ -27,6 +27,7 @@ reproduce + fix, E2E): [`.claude/README.md`](.claude/README.md).**
 bin/vmx                VM layer: lima (Linux), tart (macOS), ssh (Windows)
 bin/wzfmt              formatter router: clang-format vs astyle vs neither
 bin/mdcheck            the three doc rules markdownlint cannot express
+bin/wzissue            issue -> branch, worktree, docs scaffold
 bin/usage-report       what of this toolkit actually gets used
 tests/hooks.sh         regression checks for the hook classification
 install.sh             link the toolkit into a checkout or worktree

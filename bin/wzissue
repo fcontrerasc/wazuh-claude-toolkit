@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""wzissue - start work on a GitHub issue: branch name, worktree, docs scaffold.
+
+    bin/wzissue 37382              create the worktree and scaffold
+    bin/wzissue 37382 --dry-run    print the plan, touch nothing
+    bin/wzissue --self-test        check the label and slug rules
+
+Everything here is mechanical: the label -> prefix map, the kebab slug, the
+worktree path, linking the toolkit, and the notes.md skeleton. None of it needs a
+model, and a model doing it costs ~450 tokens and can misremember the map.
+
+What is left for a model afterwards is the part that needs judgment: a one-line
+summary of what the issue actually asks for.
+
+Idempotent by design, like vmx: an existing worktree or branch is reused and
+reported, never recreated and never deleted.
+
+Exit: 0 ok | 1 gh/git failed | 2 bad usage
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Overridable so the creation path can be tested against a throwaway checkout
+# instead of a real 1G one; both default to the real thing.
+WT_ROOT = Path(os.environ.get("WZISSUE_WT_ROOT", "/Users/fabioc/ubuntu-data/wazuh-wt"))
+WAZUH = Path(os.environ.get("WZISSUE_REPO", "/Users/fabioc/ubuntu-data/wazuh"))
+TOOLKIT = Path(__file__).resolve().parent.parent
+BRANCH_MAX = 72
+
+# First match wins. Derived from what this repo actually names branches
+# (enhancement/ 420, fix/ 288, test/ 101, spike/ 16), not the legacy 4.x bug/.
+# level/* never affects naming - it is on every issue.
+PREFIX_RULES = [
+    ("spike", "spike"),
+    ("type/bug", "fix"),
+    ("type/enhancement", "enhancement"),
+    ("type/documentation", "docs"),
+    ("type/test", "test"),
+    ("type/research", "spike"),
+    ("type/change", "change"),
+    ("type/maintenance", "change"),
+]
+DEFAULT_PREFIX = "enhancement"
+
+
+def prefix_for(labels) -> str:
+    names = [n.lower() for n in labels]
+    for needle, prefix in PREFIX_RULES:
+        for n in names:
+            if n == needle or n.startswith(needle + "/"):
+                return prefix
+    return DEFAULT_PREFIX
+
+
+def slugify(title: str) -> str:
+    """Kebab slug. A leading "Spike:" is dropped - the prefix already says it."""
+    t = re.sub(r"^\s*\[?spike\]?\s*:?\s*", "", title, flags=re.I)
+    t = re.sub(r"[^a-zA-Z0-9]+", "-", t).strip("-").lower()
+    return re.sub(r"-{2,}", "-", t)
+
+
+def branch_for(prefix: str, issue: int, slug: str) -> str:
+    """<prefix>/<issue>-<slug>, truncated at a word boundary within BRANCH_MAX."""
+    head = f"{prefix}/{issue}-"
+    room = BRANCH_MAX - len(head)
+    if len(slug) <= room:
+        return head + slug
+    cut = slug[:room]
+    if "-" in cut:
+        cut = cut.rsplit("-", 1)[0]          # never end mid-word
+    return head + cut.rstrip("-")
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+def wazuh_repo() -> Path:
+    """The wazuh checkout to ask gh about and hang the worktree off.
+
+    Never cwd alone: gh reads the repo from the working directory, so running
+    this from the toolkit checkout asked the toolkit for issue 37382 and got
+    "Could not resolve to an issue". A wazuh checkout has src/Makefile.
+    """
+    if "WZISSUE_REPO" in os.environ:      # explicit beats ambient
+        return WAZUH
+    top = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if top.returncode == 0:
+        candidate = Path(top.stdout.strip()).parent
+        if (candidate / "src/Makefile").exists():
+            return candidate
+    if (WAZUH / "src/Makefile").exists():
+        return WAZUH
+    die(f"no wazuh checkout here or at {WAZUH}", 2)
+
+
+def die(msg: str, code: int = 1):
+    print(f"wzissue: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def self_test() -> int:
+    cases = [
+        (["spike", "level/task"], "spike"),
+        (["type/bug"], "fix"),
+        (["type/bug/regression"], "fix"),
+        (["type/enhancement/new-feature"], "enhancement"),
+        (["type/documentation"], "docs"),
+        (["type/test/e2e"], "test"),
+        (["type/research"], "spike"),
+        (["spike", "type/bug"], "spike"),          # first rule wins
+        (["type/maintenance"], "change"),
+        (["level/subtask"], "enhancement"),        # level/* never decides
+        ([], "enhancement"),
+    ]
+    for labels, want in cases:
+        got = prefix_for(labels)
+        assert got == want, f"prefix_for({labels}) = {got}, want {want}"
+
+    assert slugify("Spike: Container Instances") == "container-instances"
+    assert slugify("[Spike] eBPF & whodata") == "ebpf-whodata"
+    assert slugify("Fix  the   thing!!") == "fix-the-thing"
+
+    assert branch_for("fix", 1, "short") == "fix/1-short"
+    assert branch_for("spike", 37382, slugify(
+        "Spike: Evaluate container instance collection with eBPF enrichment")) == \
+        "spike/37382-evaluate-container-instance-collection-with-ebpf-enrichment"
+
+    # Properties, asserted rather than a hand-computed string: within the limit,
+    # never ending mid-word or on a hyphen, and always a prefix of the full name.
+    for title in [
+        "Spike: Evaluate container instance collection with eBPF enrichment "
+        "across every supported architecture",
+        "agent stops syncing inventory after the manager restarts unexpectedly "
+        "during a scan",
+        "a" * 200,
+    ]:
+        slug = slugify(title)
+        b = branch_for("spike", 37382, slug)
+        assert len(b) <= BRANCH_MAX, (len(b), b)
+        assert not b.endswith("-"), b
+        assert f"spike/37382-{slug}".startswith(b), (b, slug)
+        tail = b.split("-", 1)[1]
+        assert tail in slug.split("~") or slug.startswith(tail), (tail, slug)
+        # A truncated branch must break where the slug has a boundary, so the
+        # last word is whole - unless the slug is one unbroken word.
+        if len(b) < len(f"spike/37382-{slug}") and "-" in slug:
+            assert slug[len(tail)] == "-", (b, slug)
+
+    print("wzissue self-test: ok")
+    return 0
+
+
+NOTES = """# Issue {issue}: {title}
+
+Labels: {labels}
+Branch: `{branch}`
+Worktree: `{worktree}`
+
+## Findings
+
+## Decisions
+
+## Open
+"""
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--self-test" in args:
+        return self_test()
+    nums = [a for a in args if a.isdigit()]
+    if len(nums) != 1:
+        die("usage: wzissue <issue-number> [--dry-run]", 2)
+    issue = int(nums[0])
+    dry = "--dry-run" in args
+
+    repo = wazuh_repo()
+    r = run(["gh", "issue", "view", str(issue), "--json", "number,title,labels,url"],
+            cwd=repo)
+    if r.returncode:
+        die(f"gh issue view {issue}: {r.stderr.strip()}")
+    data = json.loads(r.stdout)
+    title = data["title"]
+    labels = [lb["name"] for lb in data.get("labels", [])]
+
+    prefix = prefix_for(labels)
+    slug = slugify(title)
+    branch = branch_for(prefix, issue, slug)
+    # Directory name comes from the branch, which is already truncated at a word
+    # boundary - slicing the slug again left names ending "...via-eb".
+    # The parent is not a free choice either: a worktree's .git is a file pointing
+    # into the main repo, so all of wazuh-wt must be one rsync root for vmx.
+    worktree = WT_ROOT / branch.replace("/", "-")
+
+    # Prior attempts are worth knowing before starting a branch.
+    pr = run(["gh", "pr", "list", "--search", str(issue), "--state", "all",
+              "--json", "number,title,state"], cwd=repo)
+    prs = json.loads(pr.stdout) if pr.returncode == 0 and pr.stdout.strip() else []
+
+    print(f"repo     {repo}")
+    print(f"issue    {issue}  {title}")
+    print(f"labels   {', '.join(labels) or '-'}")
+    print(f"branch   {branch}")
+    print(f"worktree {worktree}")
+    for p in prs:
+        print(f"prior PR #{p['number']} [{p['state']}] {p['title']}")
+
+    if dry:
+        print("dry-run: nothing created")
+        return 0
+
+    if worktree.exists():
+        print(f"exists   worktree already present, reusing")
+    else:
+        have_branch = run(["git", "-C", str(repo), "rev-parse", "--verify",
+                           f"refs/heads/{branch}"]).returncode == 0
+        cmd = ["git", "-C", str(repo), "worktree", "add", str(worktree)]
+        cmd += [branch] if have_branch else ["-b", branch]
+        w = run(cmd)
+        if w.returncode:
+            die(f"git worktree add: {w.stderr.strip()}")
+        print(f"created  {'checked out existing' if have_branch else 'new'} branch")
+
+    inst = run([str(TOOLKIT / "install.sh"), str(worktree)])
+    if inst.returncode:
+        die(f"install.sh: {inst.stderr.strip()}")
+    print(f"linked   {inst.stdout.count(' -> ')} toolkit paths")
+
+    notes = worktree / "docs" / str(issue) / "notes.md"
+    if notes.exists():
+        print(f"notes    {notes} (kept)")
+    else:
+        notes.parent.mkdir(parents=True, exist_ok=True)
+        notes.write_text(NOTES.format(
+            issue=issue, title=title, labels=", ".join(labels) or "-",
+            branch=branch, worktree=worktree))
+        print(f"notes    {notes}")
+
+    print(f"\ncd {worktree}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

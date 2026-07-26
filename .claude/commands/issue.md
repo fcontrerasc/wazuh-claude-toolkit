@@ -1,61 +1,25 @@
 ---
 description: Start work on a GitHub issue - worktree, branch, docs scaffold
 argument-hint: <issue-number>
-allowed-tools: Bash(gh issue view:*), Bash(gh pr list:*), Bash(git worktree:*), Bash(git branch:*), Read, Write
+allowed-tools: Bash(bin/wzissue *), Bash(gh issue view:*), Read, Write, Edit
 ---
 
 Start work on issue **$ARGUMENTS**.
 
-## 1. Read
-
-`gh issue view $ARGUMENTS --json number,title,labels,body,comments` plus
-`gh pr list --search "$ARGUMENTS" --state all` for prior attempts.
-
-## 2. Branch prefix from labels
-
-First match wins. Derived from what this repo actually names branches
-(`enhancement/` 420, `fix/` 288, `test/` 101, `spike/` 16) — not from the legacy
-4.x `bug/` form.
-
-| Label | Prefix |
-|---|---|
-| `spike` | `spike` |
-| `type/bug`, `type/bug/*` | `fix` |
-| `type/enhancement`, `type/enhancement/*` | `enhancement` |
-| `type/documentation` | `docs` |
-| `type/test`, `type/test/*` | `test` |
-| `type/research` without `spike` | `spike` |
-| `type/change`, `type/maintenance` | `change` |
-| none of the above | `enhancement` |
-
-`level/*` labels never affect naming — they are on every issue.
-
-Branch: `<prefix>/<issue>-<kebab-title>`. Strip a leading `Spike: `, truncate at
-72 chars on a word boundary.
-
-## 3. Worktree
-
 ```bash
-git worktree add /Users/fabioc/ubuntu-data/wazuh-wt/<prefix>-<issue>-<slug> -b <branch>
+bin/wzissue $ARGUMENTS --dry-run     # branch, worktree path, prior PRs
+bin/wzissue $ARGUMENTS               # create, link the toolkit, scaffold notes
 ```
 
-The path is not a free choice: a worktree's `.git` is a file pointing into the
-main repo, so `vmx sync` mounts the shared parent `/Users/fabioc/ubuntu-data`.
-Worktrees elsewhere break git inside the guests.
+The script owns everything mechanical and is the authority on it: the label →
+prefix map, the kebab slug truncated at a word boundary, the worktree path under
+`wazuh-wt/`, running `install.sh`, and `docs/<issue>/notes.md`. Idempotent — an
+existing worktree or branch is reused, never recreated.
 
-Then link the toolkit into it — Claude Code reads `.claude/` from the project
-directory, so a fresh worktree has no hooks, commands or `bin/vmx` until this runs:
+Your part is the half a script cannot do:
 
-```bash
-/Users/fabioc/ubuntu-data/wazuh-claude-toolkit/install.sh <worktree-path>
-```
-
-## 4. Scaffold
-
-Create `docs/<issue>/notes.md` with: issue title, labels, branch, worktree path,
-and empty `## Findings` / `## Decisions` / `## Open` sections.
-
-## 5. Report
-
-Print branch, worktree path, docs dir, and the one-line issue summary. Do not
-start implementing until asked.
+1. Read the issue properly — `gh issue view $ARGUMENTS --json title,body,comments`.
+   Prior PRs are already listed by `wzissue`.
+2. Write the one-line statement of what is actually being asked into
+   `docs/<issue>/notes.md`, plus anything already known under `## Findings`.
+3. Report branch, worktree and that summary. Do not start implementing until asked.

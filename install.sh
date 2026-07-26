@@ -42,12 +42,17 @@ link ".markdownlint.jsonc"  ".markdownlint.jsonc"
 link "bin/vmx"              "bin/vmx"
 link "bin/wzfmt"            "bin/wzfmt"
 link "bin/mdcheck"          "bin/mdcheck"
+link "bin/wzissue"          "bin/wzissue"
 link "bin/usage-report"     "bin/usage-report"
 
-EXCLUDE="$(git -C "$TARGET" rev-parse --path-format=absolute --git-dir)/info/exclude"
+# --git-common-dir, not --git-dir: in a worktree the latter is
+# .git/worktrees/<name>/, and git does not read info/exclude from there (verified
+# with a probe file - it stayed untracked-visible). The common dir is also the
+# right scope, since every worktree gets the same links.
+EXCLUDE="$(git -C "$TARGET" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
 mkdir -p "$(dirname "$EXCLUDE")"
 for path in ".claude" ".markdownlint.jsonc" "bin/vmx" "bin/wzfmt" \
-            "bin/mdcheck" "bin/usage-report"; do
+            "bin/mdcheck" "bin/wzissue" "bin/usage-report"; do
     grep -qxF "/$path" "$EXCLUDE" 2>/dev/null || echo "/$path" >> "$EXCLUDE"
 done
 echo "excluded locally via $EXCLUDE"
