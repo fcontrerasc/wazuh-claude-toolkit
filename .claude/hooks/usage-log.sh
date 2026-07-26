@@ -23,13 +23,23 @@ case "$EVENT" in
         FIRST="$(printf '%s' "$PROMPT" | awk '{print $1}')"
         case "$FIRST" in
             /*/*) : ;;                       # a path, not a command
-            /[a-zA-Z]*) kind="command"; name="$FIRST" ;;
+            # Name without the slash, so it matches the file on disk: a report
+            # keyed on "/cheatsheet" can never find commands/cheatsheet.md.
+            /[a-zA-Z]*) kind="command"; name="${FIRST#/}" ;;
         esac
         ;;
     PreToolUse)
         TOOL="$(printf '%s' "$INPUT" | jq -r '.tool_name // ""')"
         case "$TOOL" in
-            Skill) kind="skill"; name="$(printf '%s' "$INPUT" | jq -r '.tool_input.skill // ""')" ;;
+            # Slash commands are exposed to the model as skills, so the Skill
+            # tool fires for both. Whichever directory holds the file wins.
+            Skill)
+                name="$(printf '%s' "$INPUT" | jq -r '.tool_input.skill // ""')"
+                if [ -f "$(dirname "$0")/../commands/$name.md" ]; then
+                    kind="command"
+                else
+                    kind="skill"
+                fi ;;
             Agent) kind="agent"; name="$(printf '%s' "$INPUT" | jq -r '.tool_input.subagent_type // "general-purpose"')" ;;
             Bash)
                 C="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""')"

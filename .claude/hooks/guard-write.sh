@@ -83,12 +83,15 @@ esac
 # Any rm, not only rm -rf: deleting one file is just as irreversible. Scratchpad
 # paths are exempt - that directory exists to be thrown away.
 if printf '%s' "$CMD" | grep -qE '(^|[;&|[:space:]])rm([[:space:]]|$)'; then
+    # The temp exemptions must anchor at the start of a path: a bare */tmp/*
+    # also exempts ~/work/tmp/something-that-matters.
     case "$CMD" in
-        *"/scratchpad/"*|*"/private/tmp/claude-"*|*"/tmp/"*) ;;
+        *"/scratchpad/"*|*[[:space:]]/private/tmp/*|*[[:space:]]/tmp/*) ;;
         *) ask "Deletion: $CMD
 Confirm the target above; deletions are not recoverable." ;;
     esac
 fi
 
-log_use hook guard-write allow
+# No log line on the allow path: this hook runs on every Bash call, so logging
+# it would turn the usage log into a Bash counter. Only deny/ask are events.
 exit 0

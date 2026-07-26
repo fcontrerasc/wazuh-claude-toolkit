@@ -15,6 +15,10 @@ Decision rule, applied to the window:
     0 uses      -> delete it
     1-2 uses    -> fold into a neighbour
     steady      -> keep
+
+Hooks are exempt from that rule. They fire on every matching tool call, so a
+count says nothing about value; their counts are *events* (deny, ask, finding)
+and their verdict is whether settings.json still references them.
 """
 
 import json
@@ -52,9 +56,25 @@ def on_disk() -> dict[str, set[str]]:
         "command": {p.stem for p in (TOOLKIT / ".claude/commands").glob("*.md")},
         "skill": {p.parent.name for p in (TOOLKIT / ".claude/skills").glob("*/SKILL.md")},
         "agent": {p.stem for p in (TOOLKIT / ".claude/agents").glob("*.md")},
+        # status-line.sh is a statusLine command, not a hook, and never fires as
+        # one. lib-* are sourced, not registered.
         "hook": {p.stem for p in (TOOLKIT / ".claude/hooks").glob("*.sh")
-                 if not p.stem.startswith("lib-")},
+                 if not p.stem.startswith("lib-") and p.stem != "status-line"},
     }
+
+
+def wired() -> set[str]:
+    """Hook basenames registered in settings.
+
+    A hook that fires on every tool call cannot be usage-ranked, so the useful
+    question is whether it is wired, not how often it ran.
+    """
+    text = ""
+    for f in ("settings.json", "settings.local.json"):
+        p = TOOLKIT / ".claude" / f
+        if p.exists():
+            text += p.read_text(errors="replace")
+    return {n for n in on_disk()["hook"] if f"{n}.sh" in text}
 
 
 def main() -> int:
@@ -62,7 +82,11 @@ def main() -> int:
     as_json = "--json" in args
     days = 30
     if "--days" in args:
-        days = int(args[args.index("--days") + 1])
+        i = args.index("--days") + 1
+        if i >= len(args) or not args[i].isdigit():
+            print("usage-report: --days needs a number", file=sys.stderr)
+            return 2
+        days = int(args[i])
 
     if not LOG.exists():
         print(f"no usage log yet at {LOG}")
@@ -72,6 +96,7 @@ def main() -> int:
     cutoff = now - timedelta(days=days)
     total, window, last, details = (defaultdict(int), defaultdict(int), {},
                                     defaultdict(lambda: defaultdict(int)))
+    earliest = None
 
     for line in LOG.read_text(errors="replace").splitlines():
         rec = parse(line)
@@ -86,6 +111,7 @@ def main() -> int:
             ts = datetime.fromisoformat(ts_s.replace("Z", "+00:00"))
         except ValueError:
             continue
+        earliest = ts if earliest is None or ts < earliest else earliest
         key = (kind, name)
         total[key] += 1
         if ts >= cutoff:
@@ -102,10 +128,19 @@ def main() -> int:
             total.setdefault(key, 0)
             window.setdefault(key, 0)
 
+    hooked = wired()
+    # A log younger than the window cannot prove disuse. Without this, the first
+    # run after a reset reads DELETE on every item that simply has no history.
+    span = (now - earliest).days if earliest else 0
+    ripe = span >= days
+
     def verdict(key) -> str:
+        kind, name = key
+        if kind == "hook":
+            return "wired" if name in hooked else "ORPHAN"
         n = window[key]
         if n == 0:
-            return "DELETE" if key[0] != "hook" else "unused"
+            return "DELETE" if ripe else "no data"
         if n <= 2:
             return "fold?"
         return "keep"
@@ -128,9 +163,15 @@ def main() -> int:
         print(f"{kind + ':' + name:<{width}}  {total[key]:>5} {window[key]:>5}  "
               f"{ago:<9} {verdict(key):<8} {det}")
 
+    print("\nhook rows count events (deny/ask/finding), not fires; "
+          "ORPHAN = on disk, absent from settings")
+    if not ripe:
+        print(f"log spans {span}d of the {days}d window - no verdict on unused "
+              f"items yet; re-run after {days - span}d")
+        return 0
     dead = [f"{k}:{n}" for (k, n) in total if verdict((k, n)) == "DELETE"]
     if dead:
-        print(f"\n{len(dead)} never used in {days}d -> delete: {', '.join(sorted(dead))}")
+        print(f"{len(dead)} never used in {days}d -> delete: {', '.join(sorted(dead))}")
     return 0
 
 
