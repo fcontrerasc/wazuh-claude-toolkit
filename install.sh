@@ -41,12 +41,13 @@ link ".markdownlint.jsonc"  ".markdownlint.jsonc"
 # bin/ already holds repo scripts (wazuh-control), so link the files, not the dir.
 link "bin/vmx"              "bin/vmx"
 link "bin/wzfmt"            "bin/wzfmt"
+link "bin/mdcheck"          "bin/mdcheck"
 link "bin/usage-report"     "bin/usage-report"
 
 EXCLUDE="$(git -C "$TARGET" rev-parse --path-format=absolute --git-dir)/info/exclude"
 mkdir -p "$(dirname "$EXCLUDE")"
 for path in ".claude" ".markdownlint.jsonc" "bin/vmx" "bin/wzfmt" \
-            "bin/usage-report"; do
+            "bin/mdcheck" "bin/usage-report"; do
     grep -qxF "/$path" "$EXCLUDE" 2>/dev/null || echo "/$path" >> "$EXCLUDE"
 done
 echo "excluded locally via $EXCLUDE"

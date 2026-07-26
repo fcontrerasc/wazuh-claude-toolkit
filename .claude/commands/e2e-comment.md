@@ -1,7 +1,7 @@
 ---
 description: Size-check, lint and post a filled E2E evidence comment
 argument-hint: <issue-number> [--post]
-allowed-tools: Read, Bash(bin/wzfmt *), Bash(markdownlint:*), Bash(gh issue comment:*), Bash(wc:*)
+allowed-tools: Read, Bash(bin/mdcheck *), Bash(gh issue comment:*), Bash(wc:*)
 ---
 
 E2E comment for **$ARGUMENTS**.
@@ -27,8 +27,9 @@ this out. (For reference: issue 37470's two arch transcripts were 36.8k + 37.5k.
 
 ## 3. Lint
 
-Run the md-lint rules: no in-page anchor links, no stacked images, no
-cleanup/teardown sections.
+```bash
+bin/mdcheck docs/<issue>/comments/e2e-draft.md
+```
 
 ## 4. Post — only with `--post`, and only after confirmation
 

@@ -36,6 +36,11 @@ if [ "$RC" -ne 1 ]; then log_use hook fmt-on-write clean; exit 0; fi
 log_use hook fmt-on-write finding
 
 DECISION="$(WZFMT_QUIET_VERSION=1 "$WZFMT" --which "$FILE" 2>/dev/null | cut -f1)"
-printf 'Style (%s, advisory - host tool version differs from CI):\n%s\n' \
-    "$DECISION" "$OUT" >&2
+
+# The count and the fix, not the diff. Whatever the diff says, the answer is the
+# same command, so pasting it into the model's context buys nothing and a long
+# clang-format dry-run can cost thousands of tokens per edit.
+LINES="$(printf '%s\n' "$OUT" | grep -c . )"
+printf 'Style (%s): %s finding(s), advisory - host tool version differs from CI.\nFix: bin/wzfmt --write %s\n' \
+    "$DECISION" "$LINES" "$FILE" >&2
 exit 2

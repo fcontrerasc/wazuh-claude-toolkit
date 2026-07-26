@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # md-lint.sh - PostToolUse markdown check for docs/**/*.md.
 #
-# markdownlint is the same binary nvim uses (lua/kickstart/plugins/lint.lua),
-# reading .markdownlint.jsonc so editor and hook agree.
-#
-# Three extra rules markdownlint cannot express, each from a standing rule about
-# how these docs get read:
-#   1. no in-page anchor links   - they do not resolve in GitHub comments
-#   2. no stacked image placeholders - one image per labeled verification section
-#   3. no Cleanup/Teardown sections  - VMs are short-lived; no cleanup steps
+# Scope only. The rules live in bin/mdcheck, so the hook, /e2e-comment,
+# /pr-description and a pre-commit check all enforce the same three and cannot
+# drift apart.
 
 set -u
 
@@ -28,43 +23,15 @@ case "$REL" in
     docs/*.md) ;;
     *) exit 0 ;;
 esac
-PROBLEMS=""
 
-if command -v markdownlint >/dev/null 2>&1; then
-    CFG=""
-    [ -f "$ROOT/.markdownlint.jsonc" ] && CFG="--config $ROOT/.markdownlint.jsonc"
-    OUT="$(markdownlint $CFG "$FILE" 2>&1)" || PROBLEMS="$OUT"
+MDCHECK="$ROOT/bin/mdcheck"
+[ -x "$MDCHECK" ] || exit 0
+
+if OUT="$("$MDCHECK" "$FILE" 2>&1)"; then
+    log_use hook md-lint clean
+    exit 0
 fi
 
-# 1. in-page anchors: [text](#anchor)
-ANCHORS="$(grep -nE '\]\(#[^)]+\)' "$FILE" || true)"
-[ -n "$ANCHORS" ] && PROBLEMS="$PROBLEMS
-in-page anchor links do not resolve in GitHub comments:
-$ANCHORS"
-
-# 2. two image placeholders/images with nothing between them
-STACKED="$(awk '
-    /^[[:space:]]*(!\[|<!--[[:space:]]*image|<PASTE.*image)/ {
-        if (prev_img && NR - prev_line <= 2) print prev_line": "prev"\n"NR": "$0
-        prev_img = 1; prev_line = NR; prev = $0; next
-    }
-    /^[[:space:]]*$/ { next }
-    { prev_img = 0 }
-' "$FILE" || true)"
-[ -n "$STACKED" ] && PROBLEMS="$PROBLEMS
-stacked images: give each one its own labeled verification section:
-$STACKED"
-
-# 3. cleanup sections
-CLEAN="$(grep -nEi '^#{1,6}[[:space:]]*(clean[ -]?up|tear[ -]?down)' "$FILE" || true)"
-[ -n "$CLEAN" ] && PROBLEMS="$PROBLEMS
-cleanup/teardown sections are not used in these docs:
-$CLEAN"
-
-if [ -n "$(printf '%s' "$PROBLEMS" | tr -d '[:space:]')" ]; then
-    log_use hook md-lint finding
-    printf 'md-lint %s:\n%s\n' "$FILE" "$PROBLEMS" >&2
-    exit 2
-fi
-log_use hook md-lint clean
-exit 0
+log_use hook md-lint finding
+printf '%s\n' "$OUT" >&2
+exit 2

@@ -5,8 +5,8 @@ description: Style for Wazuh design docs, use-case docs and verification docs un
 
 # Doc style
 
-The mechanical rules are enforced by the `md-lint` hook (no in-page anchor links,
-no stacked images, no cleanup sections). What is left is judgment:
+The mechanical rules are enforced by `bin/mdcheck` (which the `md-lint` hook runs
+on every `docs/**/*.md` write). What is left is judgment:
 
 - **Lean.** Cut every sentence that does not change what the reader does.
 - **Option-framed.** Present choices as options with trade-offs, then a

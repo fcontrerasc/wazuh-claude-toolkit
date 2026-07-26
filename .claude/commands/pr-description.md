@@ -1,7 +1,7 @@
 ---
 description: Generate PR title and description from the repo template
 argument-hint: <issue-number>
-allowed-tools: Read, Bash(git log:*), Bash(git diff:*), Bash(git branch:*), Bash(markdownlint:*)
+allowed-tools: Read, Bash(git log:*), Bash(git diff:*), Bash(git branch:*), Bash(bin/mdcheck *)
 ---
 
 PR description for issue **$ARGUMENTS**.
@@ -36,8 +36,7 @@ PR description for issue **$ARGUMENTS**.
 
 ## 3. Before handing it over
 
-Run the md-lint rules on the text: no in-page anchor links (they do not resolve in
-GitHub), no stacked images, no cleanup sections.
+Write the text to a file and check it: `bin/mdcheck <path>`.
 
 Print it for review. Do not post it — `gh pr create` and `gh pr edit` are gated,
 and the PR body is yours to submit.

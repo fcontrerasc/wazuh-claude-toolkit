@@ -11,7 +11,8 @@ TOOLKIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 H="$TOOLKIT/.claude/hooks"
 LOG="$(mktemp -t wztest-usage)"
 export CLAUDE_USAGE_LOG="$LOG"
-trap 'rm -f "$LOG"' EXIT
+SANDBOX="$(mktemp -d -t wztest-root)"
+trap 'rm -rf "$LOG" "$SANDBOX"' EXIT
 pass=0; fail=0
 ck() { # ck <label> <expected> <actual>
     if [ "$2" = "$3" ]; then printf 'ok   %s\n' "$1"; pass=$((pass+1))
@@ -69,6 +70,57 @@ ck "rm in a nested tmp dir asks"     "ask"   "$(D 'rm /Users/fabioc/work/tmp/kee
 ck "rm in real /tmp is exempt"       "allow" "$(D 'rm -rf /tmp/scratch')"
 ck "rm in /private/tmp is exempt"    "allow" "$(D 'rm -rf /private/tmp/claude-501/x')"
 ck "rm of a source file asks"        "ask"   "$(D 'rm src/foo.cpp')"
+
+# --- mdcheck: the three rules, one implementation --------------------------
+mkdir -p "$SANDBOX/docs" "$SANDBOX/bin"
+ln -sfn "$TOOLKIT/bin/mdcheck" "$SANDBOX/bin/mdcheck"
+printf '# D\n\nSee [setup](#setup).\n\n![one](a.png)\n![two](b.png)\n\n## Cleanup\n\nx\n' \
+    > "$SANDBOX/docs/bad.md"
+printf '# D\n\n## Verification: connects\n\n![status](a.png)\n' > "$SANDBOX/docs/good.md"
+
+BAD="$("$TOOLKIT/bin/mdcheck" "$SANDBOX/docs/bad.md" 2>&1)"
+ck "mdcheck flags in-page anchors" "1" "$(printf '%s' "$BAD" | grep -c 'anchor link')"
+ck "mdcheck flags stacked images"  "1" "$(printf '%s' "$BAD" | grep -c 'stacked images')"
+ck "mdcheck flags cleanup section" "1" "$(printf '%s' "$BAD" | grep -c 'cleanup/teardown')"
+"$TOOLKIT/bin/mdcheck" "$SANDBOX/docs/good.md" >/dev/null 2>&1
+ck "mdcheck passes a clean doc" "0" "$?"
+"$TOOLKIT/bin/mdcheck" >/dev/null 2>&1
+ck "mdcheck with no args exits 2" "2" "$?"
+
+# --- md-lint hook: scope, and delegation to mdcheck -------------------------
+mdlint() { # mdlint <path> -> stderr
+    jq -n --arg f "$1" '{tool_input:{file_path:$f}}' \
+        | CLAUDE_PROJECT_DIR="$SANDBOX" "$H/md-lint.sh" 2>&1 >/dev/null
+}
+fresh
+ck "hook reports the bad doc via mdcheck" "1" "$(mdlint "$SANDBOX/docs/bad.md" | grep -c 'cleanup/teardown')"
+ck "and logs it as a finding" "hook md-lint finding" "$(lastlog)"
+
+fresh
+ck "hook passes the clean doc" "" "$(mdlint "$SANDBOX/docs/good.md")"
+ck "and logs it as clean" "hook md-lint clean" "$(lastlog)"
+
+# A doc outside docs/ is out of scope even with the same problems in it.
+mkdir -p "$SANDBOX/.claude/skills/x"
+cp "$SANDBOX/docs/bad.md" "$SANDBOX/.claude/skills/x/SKILL.md"
+ck "a SKILL.md is out of scope" "" "$(mdlint "$SANDBOX/.claude/skills/x/SKILL.md")"
+
+# --- fmt-on-write: a bounded message, never the diff -----------------------
+# Stub wzfmt: 500 findings. The hook must still emit a short fix instruction.
+cat > "$SANDBOX/bin/wzfmt" <<'STUB'
+#!/bin/sh
+case "$1" in
+    --which) printf 'clang-format\tstub\n'; exit 0 ;;
+    --check) i=0; while [ $i -lt 500 ]; do echo "line $i differs"; i=$((i+1)); done; exit 1 ;;
+esac
+STUB
+chmod +x "$SANDBOX/bin/wzfmt"
+printf 'int main(){}\n' > "$SANDBOX/x.cpp"
+FMT="$(jq -n --arg f "$SANDBOX/x.cpp" '{tool_input:{file_path:$f}}' \
+       | CLAUDE_PROJECT_DIR="$SANDBOX" "$H/fmt-on-write.sh" 2>&1 >/dev/null)"
+ck "fmt-on-write does not paste the diff" "2" "$(printf '%s\n' "$FMT" | grep -c .)"
+ck "fmt-on-write reports the count" "1" "$(printf '%s' "$FMT" | grep -c '500 finding')"
+ck "fmt-on-write names the fix" "1" "$(printf '%s' "$FMT" | grep -c 'wzfmt --write')"
 
 # --- usage-report: argument guard, and hooks reported as wired -------------
 R="$TOOLKIT/bin/usage-report"

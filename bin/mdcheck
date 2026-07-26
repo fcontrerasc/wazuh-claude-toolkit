@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# mdcheck - the markdown rules for this repo's docs, in one place.
+#
+#   bin/mdcheck FILE...     prints problems, exits 1 if any
+#
+# markdownlint covers the mechanical rules (same binary and .markdownlint.jsonc
+# nvim uses). Three rules it cannot express are checked here, each from a standing
+# rule about how these docs get read:
+#   1. no in-page anchor links       - they do not resolve in GitHub comments
+#   2. no stacked image placeholders - one image per labeled verification section
+#   3. no Cleanup/Teardown sections  - VMs are short-lived; no cleanup steps
+#
+# Existed as four copies before: the md-lint hook, /e2e-comment, /pr-description
+# and the wazuh-docs skill each described it. A command that says "run bin/mdcheck"
+# costs a line instead of a rule list, and the rules cannot drift apart.
+
+set -u
+
+if [ $# -eq 0 ]; then
+    echo "usage: mdcheck FILE..." >&2
+    exit 2
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CFG=""
+for c in "$ROOT/.markdownlint.jsonc" "$PWD/.markdownlint.jsonc"; do
+    [ -f "$c" ] && { CFG="$c"; break; }
+done
+
+problems=0
+
+for FILE in "$@"; do
+    [ -f "$FILE" ] || { printf '%s: no such file\n' "$FILE" >&2; problems=1; continue; }
+    out=""
+
+    if command -v markdownlint >/dev/null 2>&1; then
+        if [ -n "$CFG" ]; then
+            out="$(markdownlint --config "$CFG" "$FILE" 2>&1)" || :
+        else
+            out="$(markdownlint "$FILE" 2>&1)" || :
+        fi
+    fi
+
+    anchors="$(grep -nE '\]\(#[^)]+\)' "$FILE" || true)"
+    [ -n "$anchors" ] && out="$out
+in-page anchor links do not resolve in GitHub comments:
+$anchors"
+
+    # Two image placeholders with nothing but blank lines between them.
+    stacked="$(awk '
+        /^[[:space:]]*(!\[|<!--[[:space:]]*image|<PASTE.*image)/ {
+            if (prev_img && NR - prev_line <= 2) print prev_line": "prev"\n"NR": "$0
+            prev_img = 1; prev_line = NR; prev = $0; next
+        }
+        /^[[:space:]]*$/ { next }
+        { prev_img = 0 }
+    ' "$FILE" || true)"
+    [ -n "$stacked" ] && out="$out
+stacked images: give each one its own labeled verification section:
+$stacked"
+
+    cleanup="$(grep -nEi '^#{1,6}[[:space:]]*(clean[ -]?up|tear[ -]?down)' "$FILE" || true)"
+    [ -n "$cleanup" ] && out="$out
+cleanup/teardown sections are not used in these docs:
+$cleanup"
+
+    if [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+        printf 'mdcheck %s:\n' "$FILE"
+        printf '%s\n' "$out" | sed '/./,$!d'   # drop the leading blank lines
+        problems=1
+    fi
+done
+
+exit "$problems"
