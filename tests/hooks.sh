@@ -124,6 +124,45 @@ ck "fmt-on-write does not paste the diff" "2" "$(printf '%s\n' "$FMT" | grep -c 
 ck "fmt-on-write reports the count" "1" "$(printf '%s' "$FMT" | grep -c '500 finding')"
 ck "fmt-on-write names the fix" "1" "$(printf '%s' "$FMT" | grep -c 'wzfmt --write')"
 
+# --- pre-commit: blocks on docs, only warns on style -----------------------
+# A real repo with real commits: this hook gates the user's commits, so asserting
+# on anything less than `git commit` exit codes would not be evidence.
+REPO="$SANDBOX/repo"
+mkdir -p "$REPO/bin" "$REPO/docs"
+git init -q "$REPO"
+ln -sfn "$TOOLKIT/bin/mdcheck" "$REPO/bin/mdcheck"
+ln -sfn "$TOOLKIT/git-hooks/pre-commit" "$REPO/.git/hooks/pre-commit"
+git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
+commit() { git -C "$REPO" commit -q -m "$1" >/dev/null 2>&1; echo $?; }
+
+printf '# D\n\n## Cleanup\n\nx\n' > "$REPO/docs/bad.md"
+git -C "$REPO" add docs/bad.md
+ck "pre-commit blocks a doc that breaks the rules" "1" "$(commit 'bad')"
+
+printf '# D\n\n## Verification: works\n\n![s](a.png)\n' > "$REPO/docs/bad.md"
+git -C "$REPO" add docs/bad.md
+ck "pre-commit passes a clean doc" "0" "$(commit 'good')"
+
+# markdownlint-only findings (unlabelled code fence, list without blank lines)
+# must not block: docs predating the hook are full of them.
+printf '# D\n\ntext\n- a\n- b\n\n```\nraw\n```\n' > "$REPO/docs/lintonly.md"
+git -C "$REPO" add docs/lintonly.md
+ck "markdownlint-only findings do not block" "0" "$(commit 'lint only')"
+"$TOOLKIT/bin/mdcheck" "$REPO/docs/lintonly.md" >/dev/null 2>&1
+ck "but a full mdcheck still reports them" "1" "$?"
+
+# Style is advisory: a stub that always reports findings must not block a commit.
+cat > "$REPO/bin/wzfmt" <<'STUB'
+#!/bin/sh
+echo "x.cpp would change"; exit 1
+STUB
+chmod +x "$REPO/bin/wzfmt"
+printf 'int  main( ){}\n' > "$REPO/x.cpp"
+git -C "$REPO" add x.cpp
+OUT="$(cd "$REPO" && git commit -m style 2>&1)"
+ck "pre-commit does not block on style" "0" "$?"
+ck "but it does say so" "1" "$(printf '%s' "$OUT" | grep -c 'advisory')"
+
 # --- wzissue: label map, slug and branch truncation ------------------------
 "$TOOLKIT/bin/wzissue" --self-test >/dev/null 2>&1
 ck "wzissue self-test passes" "0" "$?"

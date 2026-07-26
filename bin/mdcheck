@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # mdcheck - the markdown rules for this repo's docs, in one place.
 #
-#   bin/mdcheck FILE...     prints problems, exits 1 if any
+#   bin/mdcheck FILE...                prints problems, exits 1 if any
+#   bin/mdcheck --rules-only FILE...   the three rules only, no markdownlint
 #
 # markdownlint covers the mechanical rules (same binary and .markdownlint.jsonc
 # nvim uses). Three rules it cannot express are checked here, each from a standing
@@ -16,8 +17,18 @@
 
 set -u
 
+# --rules-only skips markdownlint and checks just the three rules above. The
+# pre-commit hook uses it: markdownlint findings are plentiful in docs written
+# before it was wired up, and blocking a commit on those would make --no-verify a
+# habit, which would cost the three rules too. Those three are always fixable in
+# seconds, so they are the ones worth blocking on.
+RULES_ONLY=0
+case "${1:-}" in
+    --rules-only) RULES_ONLY=1; shift ;;
+esac
+
 if [ $# -eq 0 ]; then
-    echo "usage: mdcheck FILE..." >&2
+    echo "usage: mdcheck [--rules-only] FILE..." >&2
     exit 2
 fi
 
@@ -33,7 +44,7 @@ for FILE in "$@"; do
     [ -f "$FILE" ] || { printf '%s: no such file\n' "$FILE" >&2; problems=1; continue; }
     out=""
 
-    if command -v markdownlint >/dev/null 2>&1; then
+    if [ "$RULES_ONLY" -eq 0 ] && command -v markdownlint >/dev/null 2>&1; then
         if [ -n "$CFG" ]; then
             out="$(markdownlint --config "$CFG" "$FILE" 2>&1)" || :
         else

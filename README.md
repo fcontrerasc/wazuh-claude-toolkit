@@ -29,7 +29,8 @@ bin/wzfmt              formatter router: clang-format vs astyle vs neither
 bin/mdcheck            the three doc rules markdownlint cannot express
 bin/wzissue            issue -> branch, worktree, docs scaffold
 bin/usage-report       what of this toolkit actually gets used
-tests/hooks.sh         regression checks for the hook classification
+git-hooks/pre-commit   your commits: blocks on doc rules, warns on style
+tests/hooks.sh         regression checks for the hooks and scripts
 install.sh             link the toolkit into a checkout or worktree
 assets/README.md       third-party installers to fetch (binaries stay untracked)
 ```

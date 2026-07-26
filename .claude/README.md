@@ -18,6 +18,11 @@ there is one implementation to fix and no drift between surfaces.
 |---|---|
 | `bin/vmx` | one VM execution layer: lima (Linux), tart (macOS), ssh-only (Windows). List, provision, sync, build, test, package, collect evidence |
 | `bin/wzfmt` | formatter router: derives clang-format and astyle scopes from CI config, leaves ungoverned files alone |
+| `bin/mdcheck` | the three doc rules markdownlint cannot express, in one place. `--rules-only` skips markdownlint |
+| `bin/wzissue` | issue number → label-derived branch, worktree, toolkit links, `docs/<n>/notes.md`. `--dry-run`, `--self-test` |
+| `bin/usage-report` | what of this toolkit gets used; hooks reported as wired, not counted |
+| `git-hooks/pre-commit` | on **your** commits: blocks on the three doc rules, warns on style. Linked by `install.sh` into the git common dir, so one link covers every worktree |
+| `tests/hooks.sh` | 43 assertions over the above. Run it after touching any hook or script |
 
 ### Hooks — `.claude/hooks/`, wired in `.claude/settings.json`
 
@@ -25,9 +30,9 @@ there is one implementation to fix and no drift between surfaces.
 |---|---|---|
 | `guard-write.sh` | PreToolUse Bash | **deny** `git commit/push/tag` (you commit); **deny** `gh issue/pr edit`, `gh issue close/reopen`, `gh api -X PATCH/PUT/DELETE` (that text is QA's and reviewers'); **ask** `gh issue/pr comment`, `gh pr create/review`, `gh api -X POST`, `rm -rf`, `git reset --hard`, `git clean`, `limactl/tart delete` |
 | `wrong-host-build.sh` | PreToolUse Bash | **ask** when `make`/`cmake`/`g++`/`astyle` runs on the macOS host inside the repo, with the `vmx` equivalent |
-| `fmt-on-write.sh` | PostToolUse Edit/Write | routes the edited C/C++ file through `wzfmt --check`; silent for ungoverned files |
-| `md-lint.sh` | PostToolUse Edit/Write | `markdownlint` + 3 extra rules on `docs/**/*.md`: no in-page anchors, no stacked images, no cleanup sections |
-| `usage-log.sh` | UserPromptSubmit + PreToolUse | one JSONL line per command/skill/agent/script use |
+| `fmt-on-write.sh` | PostToolUse Edit/Write | routes the edited C/C++ file through `wzfmt --check`; reports the count and the fix command, never the diff; silent for ungoverned files |
+| `md-lint.sh` | PostToolUse Edit/Write | scope check, then `bin/mdcheck` on `docs/**/*.md` |
+| `usage-log.sh` | UserPromptSubmit + PreToolUse | one TSV line per command/skill/agent/script use; command names keyed without the leading slash so they match the file on disk |
 | `build-notify.sh` | Notification | desktop notification with instance, os/arch and result |
 | `status-line.sh` | statusLine | host, model, context %, project:branch |
 
@@ -35,7 +40,7 @@ there is one implementation to fix and no drift between surfaces.
 
 | Command | Does |
 |---|---|
-| `/issue <n>` | read issue → branch prefix from labels → worktree → `docs/<n>/` scaffold |
+| `/issue <n>` | `bin/wzissue` does branch, worktree and scaffold; the model reads the issue and writes the summary |
 | `/vm [verb] [instance...]` | `bin/vmx`, default verb `list` |
 | `/build [instance] [VAR=…]` | build in a VM; routes Windows to the two-stage pipeline |
 | `/ut <module>` | fixed `TEST=1` build + `ctest -R` + failures only |

@@ -57,5 +57,16 @@ for path in ".claude" ".markdownlint.jsonc" "bin/vmx" "bin/wzfmt" \
 done
 echo "excluded locally via $EXCLUDE"
 
+# The pre-commit hook lives in the common dir too, so one link covers the main
+# checkout and every worktree. Never clobber a real hook that is already there.
+HOOKS="$(dirname "$EXCLUDE")/../hooks"
+mkdir -p "$HOOKS"
+if [ -e "$HOOKS/pre-commit" ] && [ ! -L "$HOOKS/pre-commit" ]; then
+    echo "  pre-commit: a non-symlink hook is already installed, left alone"
+else
+    ln -sfn "$TOOLKIT/git-hooks/pre-commit" "$HOOKS/pre-commit"
+    echo "  pre-commit -> git-hooks/pre-commit (blocks on doc rules, warns on style)"
+fi
+
 echo
 echo "check it:  cd $TARGET && bin/vmx doctor"
