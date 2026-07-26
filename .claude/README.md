@@ -50,7 +50,7 @@ there is one implementation to fix and no drift between surfaces.
 | `/issue-comment <n> [update\|summary]` | draft the short issue write-up |
 | `/cheatsheet <topic>` | commands-only cheatsheet, cached in `.claude/cheats/` |
 | `/usage-report` | what actually gets used; prune candidates |
-| `/pr-description` | existing user-level command, uses `docs/pull_request_template.md` |
+| `/pr-description <n>` | title and body from `docs/pull_request_template.md`, checked with `bin/mdcheck`; never posts |
 
 ### Skills — `.claude/skills/` (model-invoked)
 
@@ -380,18 +380,22 @@ verify everywhere, leave deliverables in `docs/<issue>/`, close with a short
 comment.
 
 ```bash
-/issue 37382
+bin/wzissue 37382 --dry-run     # branch, worktree path, prior PRs - creates nothing
+/issue 37382                    # the same, then the issue read and summarised
 ```
 
 Labels `spike` + `type/research` → branch `spike/37382-<slug>`, worktree at
 `/Users/fabioc/ubuntu-data/wazuh-wt/spike-37382-<slug>`, scaffold `docs/37382/`.
+`wzissue` owns that mapping, so the model cannot misremember it.
 
 | Step | Do this | Notes |
 |---|---|---|
 | Understand | ask for a `wazuh-mapper` trace per subsystem | maps land in `docs/37382/notes.md`; the archaeology stays out of the main context |
-| Design | write `docs/37382/<topic>-design.md` | `wazuh-docs` + `wazuh-cpp` load themselves; `md-lint` enforces the mechanical rules |
-| Prototype | edit in the worktree | `fmt-on-write` checks each file through `wzfmt`; ungoverned files stay untouched |
-| Verify | `/build` on all four targets, in parallel | `--json` results feed the matrix; `guard-write` ensures **you** commit |
+| Design | write `docs/37382/<topic>-design.md` | `wazuh-docs` + `wazuh-cpp` load themselves; `md-lint` runs `bin/mdcheck` on every write |
+| Prototype | edit in the worktree | `fmt-on-write` routes each file through `wzfmt` and reports a count plus the fix command, never a diff; ungoverned files stay untouched |
+| Verify | `/build` on all four targets, in parallel | `--json` results feed the matrix; delegate to `wazuh-builder` so build logs stay out of the main context |
+| Review | ask `wazuh-reviewer` before opening the PR | Iglberger on architecture, Turner on code, plus this repo's failure classes |
+| Commit | **you** commit | `guard-write` denies `git commit`/`push` to the model; `pre-commit` blocks on the three doc rules and warns on style |
 | Evidence | `bin/vmx collect <instance> --issue 37382 --from …` | manifest records commit, dirty flag, uname, arch |
 | Deliverables | the `docs/37382/` set: design, analysis, evidence, final-decisions-summary, review-and-testing guide | |
 | Close | `/issue-comment 37382 update` during, `summary` at the end | drafted to `docs/37382/comments/`, printed, posted only on confirm |
@@ -441,7 +445,8 @@ For a bug report (e.g. 37191).
 | Run | `bin/vmx exec <instance> --record docs/37191/evidence/run.log -- <cmd>` | transcript in `user@instance:~#` form, no reformatting needed |
 | Root cause | grep every caller before editing | one guard in the shared function, not one per caller |
 | Fix + test | one gtest, no comments in the body | |
-| Verify | `/ut <module>` on all four targets | a fix verified on one arch is not verified |
+| Verify | `/ut <module>` on all four targets | a fix verified on one arch is not verified; `wazuh-builder` returns the matrix, not the logs |
+| Commit | **you** commit | `pre-commit` runs on it: doc rules block, style only warns |
 | Evidence | `bin/vmx collect … --issue 37191 --from <log>` | before/after plus manifest |
 | Close | `/issue-comment 37191 summary` | |
 
@@ -541,7 +546,65 @@ confirm. Expect a split on large tests: 37470's two arch transcripts were 36.8k 
 
 ---
 
-## 5. Status
+## 5. What fires when
+
+### Always, in every workflow
+
+These are not chosen; they are wired to events and fire whether or not they have
+anything to say. Silence is the normal case.
+
+| Trigger | Fires | Says something only when |
+|---|---|---|
+| every prompt | `usage-log` | the prompt starts with a slash command |
+| every `Bash` call | `guard-write` | the command is a deny or ask class — otherwise no output, no log line |
+| every `Bash` call in the repo | `wrong-host-build` | `make`/`cmake`/`g++`/`astyle` would run on the macOS host |
+| every `Bash`/`Skill`/`Agent` call | `usage-log` | the tool is `vmx`, `wzfmt`, a skill or an agent |
+| every `Edit`/`Write` | `fmt-on-write` | the file is `.c/.cpp/.h/.hpp` **and** governed by clang-format or astyle |
+| every `Edit`/`Write` | `md-lint` | the file is `docs/**/*.md` and breaks a rule |
+| long build finishing | `build-notify` | the notification mentions vmx, build, ctest or winagent |
+| statusline render | `status-line` | always — host, model, context %, project:branch |
+| **your** `git commit` | `pre-commit` | a staged `docs/**/*.md` breaks a repo rule (blocks) or staged C/C++ has style findings (warns) |
+
+Three PreToolUse hooks on every Bash call cost ~80 ms total, measured. They stay
+separate on purpose: merging them would put a safety gate in the same process as
+telemetry, where a logging bug could block a tool call.
+
+### A. Feature or spike
+
+| | |
+|---|---|
+| Commands | `/issue` → `/build` or `/ut` → `/issue-comment`, then `/pr-description` |
+| Scripts | `wzissue`, `vmx`, `wzfmt`, `mdcheck` |
+| Skills | `wazuh-cpp` when writing or reviewing a module; `wazuh-docs` when writing the design doc; `wazuh-vm` only if a needed instance does not exist |
+| Agents | `wazuh-mapper` first (archaeology out of context), `wazuh-builder` for the arch matrix, `wazuh-reviewer` before the PR |
+| Hooks with real output | `fmt-on-write` on C++ edits, `md-lint` on the design docs, `build-notify` on long builds, `pre-commit` on your commit |
+
+### B. Reproduce and fix
+
+| | |
+|---|---|
+| Commands | `/issue` → `/repro` → `/ut` → `/issue-comment` |
+| Scripts | `wzissue`, `vmx` (`exec --record`, `collect`), `wzfmt` |
+| Skills | `wazuh-cpp` for the fix; `wazuh-vm` if the bug's platform has no instance yet |
+| Agents | `wazuh-mapper` to find every caller before editing, `wazuh-builder` to verify on four targets, `wazuh-reviewer` on the fix |
+| Hooks with real output | same as A, plus `guard-write` **ask** if a harness cleanup tries `rm` outside a temp path |
+
+### C. E2E test
+
+The only workflow where the guards matter routinely, because the whole job is
+adjacent to text that is not yours.
+
+| | |
+|---|---|
+| Commands | `/e2e` → you fill the draft → `/e2e-comment` |
+| Scripts | `vmx` (`up`, `doctor`), `mdcheck` |
+| Skills | `wazuh-vm` for any missing component instance; `wazuh-docs` for the comment structure |
+| Agents | none. No archaeology, no builds — delegating here would only add a hop |
+| Hooks with real output | `guard-write` **denies** `gh issue edit` and `gh api -X PATCH` (the body is QA's), **asks** on `gh issue comment` before anything is published; `md-lint` on the draft; `fmt-on-write` never fires — no C/C++ is touched |
+
+---
+
+## 6. Status
 
 Everything below was exercised end to end on this host, not just written.
 
@@ -572,10 +635,13 @@ nor rsync quoting (a 660M sync landed in a directory literally named `$HOME`).
 
 | Not done | Why |
 |---|---|
-| `vmx winagent` stage 2 | needs WiX v3.14, .NET 4.8.1, Windows SDK, cv2pdb 0.52 and a 32-bit `mspdb*.dll` on the Windows VM — `vmx doctor agent-win11-arm` reports all four missing |
-| `dev-macos-arm` (tart) | the cirruslabs base image ships user `admin`; a `wazuh` account must be created inside it once before `vmx` can reach it |
-| `kernel-ubuntu-amd` | created lazily, on the first eBPF/whodata task |
-| `/pr-description` in project scope | still the user-level command |
+| `kernel-ubuntu-amd` | created lazily, on the first eBPF/whodata task. The only place CI's clang-format can run (it ships as a Linux x86-64 ELF) |
+| `bin/e2e-skeleton` | one cached guide is not enough to fix the parse shape; the next real E2E issue decides it |
+| 11 commands, 3 skills, 3 agents unexercised | they exist but no real issue has run through them yet. `bin/usage-report` decides at 30 days, from the log rather than from taste |
+
+`agent-macos-arm` uses the tart base image's `admin` account rather than `wazuh`
+(the image ships `admin`, and creating a second account bought nothing); every
+other instance is `wazuh`.
 
 Deps caveat: bundles with a `99-` prefix are dev revisions and are not all
 published. `main` and current spike branches pin `99-29734`, which returns **403**,

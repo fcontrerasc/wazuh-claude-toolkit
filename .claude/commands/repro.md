@@ -23,7 +23,7 @@ Pick the instance from where the bug happens, not from what is convenient:
 |---|---|
 | Linux userspace | `builder-ubuntu-arm` |
 | eBPF / whodata / syscalls | `kernel-ubuntu-amd` |
-| macOS agent | `dev-macos-arm` |
+| macOS agent | `agent-macos-arm` |
 | Windows agent | `agent-win11-arm` |
 
 ## 3. Harness

@@ -12,7 +12,7 @@ reproduce + fix, E2E): [`.claude/README.md`](.claude/README.md).**
 
 ## Layout
 
-```
+```text
 .claude/
 ├── README.md          the real documentation - start there
 ├── settings.json      hooks + permissions (shared)

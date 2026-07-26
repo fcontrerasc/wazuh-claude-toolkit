@@ -8,7 +8,7 @@ Build: **$ARGUMENTS**
 
 ```bash
 bin/vmx build builder-ubuntu-arm TARGET=manager TEST=1
-bin/vmx build dev-macos-arm      TARGET=agent
+bin/vmx build agent-macos-arm      TARGET=agent
 bin/vmx winagent --issue N                    # two-stage Windows pipeline
 ```
 
@@ -22,7 +22,7 @@ verification matrix.
 |---|---|
 | Linux (default) | `builder-ubuntu-arm` |
 | x86 **kernel** behaviour: eBPF, whodata, syscalls | `kernel-ubuntu-amd` (qemu, slow, created lazily) |
-| macOS agent | `dev-macos-arm` |
+| macOS agent | `agent-macos-arm` |
 | Windows agent | `bin/vmx winagent` — never `build`; the Windows VM has no compiler |
 
 `vmx build` on a Windows instance exits 3 by design.

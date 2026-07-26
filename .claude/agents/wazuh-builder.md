@@ -14,7 +14,7 @@ code.
 |---|---|
 | Linux (default) | `builder-ubuntu-arm` |
 | x86 kernel behaviour (eBPF, whodata, syscalls) | `kernel-ubuntu-amd` |
-| macOS agent | `dev-macos-arm` |
+| macOS agent | `agent-macos-arm` |
 | Windows agent | `bin/vmx winagent` (two-stage; `build` exits 3 on Windows) |
 
 ```bash

@@ -102,6 +102,13 @@ fresh
 ck "hook passes the clean doc" "" "$(mdlint "$SANDBOX/docs/good.md")"
 ck "and logs it as clean" "hook md-lint clean" "$(lastlog)"
 
+# Nested docs must be in scope: the README claims docs/**/*.md, and a case glob
+# matching slashes is the only reason "docs/*.md" covers docs/37382/notes.md.
+mkdir -p "$SANDBOX/docs/37382"
+cp "$SANDBOX/docs/bad.md" "$SANDBOX/docs/37382/notes.md"
+ck "a nested doc is in scope" "1" \
+   "$(mdlint "$SANDBOX/docs/37382/notes.md" | grep -c 'cleanup/teardown')"
+
 # A doc outside docs/ is out of scope even with the same problems in it.
 mkdir -p "$SANDBOX/.claude/skills/x"
 cp "$SANDBOX/docs/bad.md" "$SANDBOX/.claude/skills/x/SKILL.md"
